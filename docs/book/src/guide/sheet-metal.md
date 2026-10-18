@@ -312,3 +312,43 @@ flat pattern and its DXF have it, and on the bottom face y runs the other way, a
 below. When the face is gone (its flange is suppressed or deleted) the sketch reports a lost
 attachment instead of moving to another face; **Redefine Sketch Plane** attaches it to another
 face. `fixed: true` still freezes the picked plane in space.
+
+## Repair doublers from a photo
+
+A riveted repair doubler is a plate that covers a damaged area of a skin: the damage is trimmed
+out to a smooth shape, rows of rivets go around the cutout and the doubler's edge sits one edge
+distance outside the last row. SolidCraft designs one from the damage's outline, and the outline
+can come straight from a photograph of the skin with the damage marked up.
+
+1. Photograph the damage square-on, with the damage outlined (or filled in) with a marker that
+   contrasts with the skin, and something of known length in the picture (a rule, two marks).
+2. `repair.trace_photo` turns the marks into polygons in millimetres: give it the photo (`path`
+   or base64 `data`) and its scale (`mm_per_pixel`, the photo's real `width_mm`, or
+   `calibrate: {a, b, distance}` with two pixels a known distance apart). Dark marks on a light
+   skin are the default; `invert: true` reads light marks on a dark one. `threshold` and
+   `min_area` tune what counts as a mark, `simplify` how fine the polygon is. The largest mark
+   is `chosen`; `region` (an index) or `at` (a pixel on the mark) picks another.
+3. `repair.doubler` designs the repair from `damage` (a polygon in mm) or from `photo` (the
+   parameters above, traced in one go): the clean-out `cutout` (the smallest rectangle around the
+   damage with rounded corners, or a circle, plus `cleanup_margin`), the rivet `rows` with their
+   positions, and the plate's outline. It returns the geometry and a DXF (`path` writes it) with
+   layers `DOUBLER` (the plate's outline), `RIVET` (its holes), `CUTOUT` (dashed: the trim line
+   for the skin), `DAMAGE` (dashed: the damage as given) and `NOTES`.
+4. `repair.doubler_sketch` draws the same plate and holes as a sketch, so the repair can carry on
+   in the design: `sheet.flange` on the sketch (`profiles: [{point: …}]` with the returned
+   `profile_point`, so the holes stay holes) makes the doubler of the active rule's thickness,
+   `sheet.flat_pattern` and `sheet.export_dxf` give the shop its flat pattern.
+
+The rivet layout follows general practice for riveted patch repairs (for instance FAA
+AC 43.13-1B, chapter 4): `rivet_diameter` (default 3.2 mm), `edge_distance` (default 2.5 ×
+the diameter, never under the diameter), `pitch` along a row (default 5 ×), `row_pitch` between
+rows (default 0.75 × the pitch) and `rows` (default 2, staggered unless `stagger: false`). The
+defaults are starting values; the applicable repair data for the structure decides the real
+ones, and the rivet count and pitches are in the result and in the DXF's note so they can be
+checked.
+
+```json
+{"command": "repair.doubler", "params": {
+  "photo": {"path": "skin.jpg", "calibrate": {"a": [120, 880], "b": [1320, 880], "distance": 150}},
+  "thickness": 1.0, "rivet_diameter": 3.2, "rows": 2, "path": "doubler.dxf"}}
+```

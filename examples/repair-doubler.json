@@ -1,0 +1,6 @@
+{"commands": [
+  {"command": "repair.doubler_sketch", "params": {"damage": [[-20, -5], [20, -5], [20, 5], [-20, 5]], "angle": 0, "thickness": 1.0, "rivet_diameter": 3.2, "rows": 2}},
+  {"command": "sketch.finish", "params": {}},
+  {"command": "sheet.flange", "params": {"sketch": "Doubler", "profiles": [{"point": [-17, -12]}], "body_name": "Doubler"}},
+  {"command": "sheet.flat_pattern", "params": {}}
+]}

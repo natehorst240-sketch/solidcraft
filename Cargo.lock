@@ -4199,6 +4199,7 @@ dependencies = [
  "cadmpeg-ir",
  "cadmpeg-registry",
  "gltf",
+ "image",
  "quick-xml",
  "rustix 1.1.5",
  "serde",

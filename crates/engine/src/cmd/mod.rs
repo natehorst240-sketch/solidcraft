@@ -57,6 +57,7 @@ mod kernel_heal_tests;
 mod parameters;
 mod plastic;
 mod render;
+mod repair;
 #[cfg(test)]
 mod script_tests;
 mod sheet;
@@ -251,6 +252,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(mesh::COMMANDS.iter());
     v.extend(construct::COMMANDS.iter());
     v.extend(sheet::COMMANDS.iter());
+    v.extend(repair::COMMANDS.iter());
     v.extend(plastic::COMMANDS.iter());
     v.extend(component::COMMANDS.iter());
     v.extend(component_link::COMMANDS.iter());
