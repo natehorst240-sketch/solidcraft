@@ -341,6 +341,15 @@ can come straight from a photograph of the skin with the damage marked up.
    `profile_point`, so the holes stay holes) makes the doubler of the active rule's thickness,
    `sheet.flat_pattern` and `sheet.export_dxf` give the shop its flat pattern.
 
+A flat sketch of a skin as the camera sees it comes from `photo.skin_sketch`: the photo and its
+scale (two pixels a known distance apart, `calibrate`), nothing drawn on the part. It fits the
+lightening holes as circles (a gradient-directed Hough search over the diameters in `holes`,
+refined by least squares) and the lower edge as an arc (the lowest light-over-dark boundary in
+every column, fitted with RANSAC so pen marks and the bench do not pull it), and draws them in
+millimetres about the first calibration point. Take the photo square-on: an angled photo
+foreshortens the far side. The result reports every circle with its centre and diameter and
+the arc with its centre, radius and ends.
+
 The skin itself can come from the photo too: `repair.skin_from_photo` takes the photo, its
 scale (the same `calibrate`, `mm_per_pixel` or `width_mm`) and the region to model as
 `outline` (its corners in the photo's pixels), finds the holes and rivet heads inside it

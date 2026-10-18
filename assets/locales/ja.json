@@ -488,6 +488,7 @@
   "cmd.parts_insert": "パーツを挿入",
   "cmd.parts_library": "標準パーツ",
   "cmd.parts_resize": "パーツ サイズを変更",
+  "cmd.photo_skin_sketch": "写真から外板スケッチ",
   "cmd.plastic_assign_rule": "プラスチック ルールを割り当て",
   "cmd.plastic_boss": "ボス",
   "cmd.plastic_lip": "リップ",

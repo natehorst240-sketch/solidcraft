@@ -332,7 +332,7 @@ fn hostile_repair_params_never_panic() {
         json!({"photo": {"data": photo(), "mm_per_pixel": 0.5}}),
         json!({"data": photo(), "mm_per_pixel": 0.5}),
     ];
-    for id in ["repair.doubler", "repair.doubler_sketch", "repair.trace_photo", "repair.skin_from_photo"] {
+    for id in ["repair.doubler", "repair.doubler_sketch", "repair.trace_photo", "repair.skin_from_photo", "photo.skin_sketch"] {
         for v in crate::tests::hostile_values() {
             for k in keys {
                 for b in &base {
@@ -534,4 +534,54 @@ fn a_skin_strip_with_its_holes_comes_out_of_an_angled_photo() {
         )
         .contains("rectangle")
     );
+}
+
+#[test]
+fn a_skin_sketch_has_the_arc_and_the_lightening_holes_in_mm() {
+    // 1600 × 900 px at 0.1 mm/px: skin above an arc of radius 1900 px (190 mm) centred at
+    // (800, −1200) px, two holes of 200 and 180 px (20 and 18 mm) across.
+    let (w, h) = (1600u32, 900u32);
+    let mut luma = vec![190u8; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let p = Vec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
+            let i = (y * w + x) as usize;
+            if p.dist(Vec2::new(800.0, -1200.0)) > 1900.0 {
+                luma[i] = 40;
+            }
+            if p.dist(Vec2::new(400.0, 300.0)) <= 100.0 || p.dist(Vec2::new(1200.0, 320.0)) <= 90.0 {
+                luma[i] = 30;
+            }
+        }
+    }
+    let data = solidcraft_doc::canvas::base64_encode(&gray_png(w, h, &luma).unwrap());
+    let mut s = Session::default();
+    // Two points 1000 px apart are 100 mm apart; the origin is the first of them, (100, 800).
+    let r =
+        run(&mut s, "photo.skin_sketch", json!({"data": data, "calibrate": {"a": [100, 800], "b": [1100, 800], "distance": 100}, "holes": [10, 40]}));
+    let holes = r["holes"].as_array().unwrap();
+    assert_eq!(holes.len(), 2, "{holes:#?}");
+    let want = [(Vec2::new(30.0, 50.0), 20.0), (Vec2::new(110.0, 48.0), 18.0)];
+    for (c, d) in want {
+        let hit = holes
+            .iter()
+            .any(|hh| crate::params::vec2(&hh["center"]).is_some_and(|q| q.dist(c) < 0.4) && (hh["diameter"].as_f64().unwrap() - d).abs() < 0.5);
+        assert!(hit, "hole {c:?} Ø{d}: {holes:#?}");
+    }
+    let arc = &r["arc"];
+    assert!((arc["radius"].as_f64().unwrap() - 190.0).abs() < 2.0, "{arc}");
+    let c = crate::params::vec2(&arc["center"]).unwrap();
+    assert!(c.dist(Vec2::new(70.0, 200.0)) < 2.0, "{arc}");
+    // The arc's ends are at the photo's sides, below the centre.
+    let (st, en) = (crate::params::vec2(&arc["start"]).unwrap(), crate::params::vec2(&arc["end"]).unwrap());
+    assert!(st.x > en.x && st.y < 200.0 && en.y < 200.0, "{arc}");
+    assert_eq!(r["curves"], 3);
+    assert_eq!(s.doc.sketch(r["sketch"].as_u64().unwrap()).unwrap().curves.len(), 3);
+    // Holes only, image origin.
+    let r = run(&mut s, "photo.skin_sketch", json!({"data": data, "mm_per_pixel": 0.1, "arc": false, "origin": "image", "holes": [10, 40]}));
+    assert!(r["arc"].is_null());
+    assert_eq!(r["curves"], 2);
+    assert!(fails(&mut s, "photo.skin_sketch", json!({"data": data})).contains("scale"));
+    assert!(fails(&mut s, "photo.skin_sketch", json!({"data": data, "mm_per_pixel": 0.1, "holes": [40, 10]})).contains("holes"));
+    assert!(fails(&mut s, "photo.skin_sketch", json!({"data": data, "mm_per_pixel": 0.1, "origin": "a"})).contains("calibrate"));
 }

@@ -488,6 +488,7 @@
   "cmd.parts_insert": "Insert Part",
   "cmd.parts_library": "Standard Parts",
   "cmd.parts_resize": "Change Part Size",
+  "cmd.photo_skin_sketch": "Skin Sketch from Photo",
   "cmd.plastic_assign_rule": "Assign Plastic Rule",
   "cmd.plastic_boss": "Boss",
   "cmd.plastic_lip": "Lip",

@@ -488,6 +488,7 @@
   "cmd.parts_insert": "插入零件",
   "cmd.parts_library": "标准零件",
   "cmd.parts_resize": "更改零件尺寸",
+  "cmd.photo_skin_sketch": "从照片生成蒙皮草图",
   "cmd.plastic_assign_rule": "指定塑料规则",
   "cmd.plastic_boss": "凸台",
   "cmd.plastic_lip": "凸缘",

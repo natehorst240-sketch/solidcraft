@@ -54,6 +54,14 @@ pub static COMMANDS: &[CommandSpec] = &[
          → {sketch, body, outline: [[x,y], …] mm, size: [w, h], holes: [{center: [x,y], diameter, center_px, dark}], mm_per_pixel}; \
          the origin is the outline's bottom-left corner, y up",
     ),
+    CommandSpec::new("photo.skin_sketch", "Skin Sketch from Photo", skin_sketch).at("SHEET METAL", "CREATE").icon("flat").params(
+        "a flat sketch of a skin as the camera sees it: its lower edge fitted as an arc and its lightening holes as circles, in mm. \
+         path | data; the scale: calibrate: {a, b, distance} | mm_per_pixel | width_mm (take the photo square-on: an angled photo foreshortens); \
+         holes?: [min, max] mm (the lightening holes' diameters to look for, default [15, 400]); max_holes?: 1…16 (default 4); \
+         arc?: bool (default true: the lowest light-over-dark edge below the holes, fitted by RANSAC); arc_below?: px (look for the edge below this photo row; default below the holes); \
+         origin?: a (default: the first calibration point) | image (the photo's bottom-left) | [px,py]; name? (default Skin), plane? (default XY) \
+         → {sketch, arc: {center, radius, start, end, inliers, points} | null, holes: [{center, diameter, center_px, coverage}], mm_per_pixel, origin_px}; y up",
+    ),
     CommandSpec::new("repair.doubler_sketch", "Repair Doubler Sketch", doubler_sketch).at("SHEET METAL", "CREATE").icon("flat").params(
         "the parameters of repair.doubler, drawn as a sketch (the plate's outline and its rivet holes): plane? (when no sketch is active, a new sketch on it; default XY), name? (default Doubler), at?: [x,y] offset; \
          sheet.flange {sketch, profiles: [{point: profile_point}]} makes the plate with its holes, sheet.export_dxf its flat pattern → {sketch, created_sketch, curves, rivets, size, profile_point: [x,y] on the plate}"
@@ -693,6 +701,7 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
         min_area_px: ((min_area / (k * k)).ceil().clamp(1.0, 1e9)) as usize,
         max_area_px: usize::MAX,
         simplify_px: simplify / k,
+        grow_px: 0,
     };
     let t = photo_trace::trace_luma(w, h, luma, &o).map_err(|e| bad(cmd, e.to_string()))?;
     // Which mark: by index, by a pixel on it, or the largest.
@@ -926,6 +935,132 @@ fn skin_from_photo(s: &mut Session, p: &Value) -> Result<Value> {
         "outline": outline_mm.iter().map(|q| pt(*q)).collect::<Vec<_>>(), "size": [w, h],
         "holes": holes.iter().map(|(c, d, px, dark)| json!({"center": pt(*c), "diameter": d, "center_px": pt(*px), "dark": dark})).collect::<Vec<_>>(),
         "mm_per_pixel": k_photo, "width_px": ow, "height_px": oh,
+    }))
+}
+
+/// The scale of a photo in mm per photo pixel, and the first calibration point if any.
+fn photo_scale(p: &Value, cmd: &str, ow: u32) -> Result<(f64, Option<Vec2>)> {
+    if let Some(k) = p.get("mm_per_pixel").filter(|v| !v.is_null()) {
+        return Ok((
+            k.as_f64().filter(|k| k.is_finite() && *k > 1e-6 && *k < 1e4).ok_or_else(|| bad(cmd, "`mm_per_pixel` must be a positive number"))?,
+            None,
+        ));
+    }
+    if let Some(wm) = p.get("width_mm").filter(|v| !v.is_null()) {
+        let wm = wm.as_f64().filter(|w| w.is_finite() && *w > 1e-3 && *w < 1e7).ok_or_else(|| bad(cmd, "`width_mm` must be a positive number"))?;
+        return Ok((wm / f64::from(ow), None));
+    }
+    if let Some(c) = p.get("calibrate").filter(|v| !v.is_null()) {
+        let a = c.get("a").and_then(vec2).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`calibrate.a` must be [px, py]"))?;
+        let b = c.get("b").and_then(vec2).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`calibrate.b` must be [px, py]"))?;
+        let dist =
+            num(c, "distance").filter(|d| *d > 1e-3 && *d < 1e7).ok_or_else(|| bad(cmd, "`calibrate.distance` must be a positive length (mm)"))?;
+        if a.dist(b) < 1.0 {
+            return Err(bad(cmd, "`calibrate.a` and `calibrate.b` must be different pixels"));
+        }
+        return Ok((dist / a.dist(b), Some(a)));
+    }
+    Err(bad(cmd, "give the scale: `calibrate: {a, b, distance}`, `mm_per_pixel` or `width_mm`"))
+}
+
+fn skin_sketch(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "photo.skin_sketch";
+    let bytes = photo_bytes(p, cmd)?;
+    let photo = photo_trace::decode_luma(&bytes).map_err(|e| bad(cmd, e.to_string()))?;
+    let f = f64::from(photo.downsampled_by);
+    let [ow, oh] = photo.original;
+    let (k_photo, cal_a) = photo_scale(p, cmd, ow)?;
+    let k = k_photo * f; // mm per grid pixel
+    // Which lightening holes to look for.
+    let (d0, d1) = match p.get("holes").filter(|v| !v.is_null()) {
+        None => (15.0, 400.0),
+        Some(v) => {
+            let r = v.as_array().filter(|a| a.len() == 2).ok_or_else(|| bad(cmd, "`holes` must be [min, max] mm"))?;
+            let d0 = r
+                .first()
+                .and_then(Value::as_f64)
+                .filter(|d| d.is_finite() && *d > 0.1 && *d < 1e5)
+                .ok_or_else(|| bad(cmd, "`holes` must be [min, max] mm"))?;
+            let d1 = r
+                .get(1)
+                .and_then(Value::as_f64)
+                .filter(|d| d.is_finite() && *d >= d0 && *d < 1e5)
+                .ok_or_else(|| bad(cmd, "`holes` must be [min, max] mm, the smallest first"))?;
+            (d0, d1)
+        }
+    };
+    let max_holes = match p.get("max_holes").filter(|v| !v.is_null()) {
+        None => 4,
+        Some(v) => v.as_u64().filter(|n| (1..=16).contains(n)).ok_or_else(|| bad(cmd, "`max_holes` must be 1 to 16"))? as usize,
+    };
+    let r_px = [(d0 / 2.0 / k).max(3.0), (d1 / 2.0 / k).max(3.0)];
+    let found = if r_px[0] > f64::from(photo.width.max(photo.height)) {
+        Vec::new()
+    } else {
+        solidcraft_io::photo_fit::circles(photo.width, photo.height, &photo.luma, r_px, max_holes).map_err(|e| bad(cmd, e.to_string()))?
+    };
+    let holes: Vec<_> = found.into_iter().filter(|c| c.coverage >= 0.6).collect();
+    // The lower edge.
+    let want_arc = bool_(p, "arc").unwrap_or(true);
+    let arc = if want_arc {
+        let below = match p.get("arc_below").filter(|v| !v.is_null()) {
+            Some(v) => (v.as_f64().filter(|y| y.is_finite() && *y >= 0.0).ok_or_else(|| bad(cmd, "`arc_below` must be a photo row"))? / f) as u32,
+            None => holes.iter().map(|c| (c.center.y + c.radius) as u32).max().unwrap_or(photo.height / 3),
+        };
+        let pts = solidcraft_io::photo_fit::bottom_edge_points(photo.width, photo.height, &photo.luma, below, 45.0);
+        solidcraft_io::photo_fit::fit_arc(&pts, 3.0, 50.0)
+    } else {
+        None
+    };
+    // Grid pixel → mm, y up, about the origin.
+    let origin_px = match p.get("origin").filter(|v| !v.is_null()) {
+        None => cal_a.unwrap_or(Vec2::new(0.0, f64::from(oh))),
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("a") => cal_a.ok_or_else(|| bad(cmd, "`origin: a` needs `calibrate`"))?,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("image") => Vec2::new(0.0, f64::from(oh)),
+        Some(v) => vec2(v).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`origin` must be a, image or [px, py]"))?,
+    };
+    let to_mm = |q: Vec2| Vec2::new((q.x * f - origin_px.x) * k_photo, (origin_px.y - q.y * f) * k_photo);
+    let holes_mm: Vec<(Vec2, f64, Vec2, f64)> = holes.iter().map(|c| (to_mm(c.center), 2.0 * c.radius * k, c.center * f, c.coverage)).collect();
+    let arc_mm = arc.as_ref().and_then(|a| {
+        let center = to_mm(a.center);
+        let r = a.radius * k;
+        // The ends: the arc's lowest run between the columns the edge was seen in.
+        let y_at = |x: f64| {
+            let dx = x - a.center.x;
+            (a.radius * a.radius - dx * dx).max(0.0).sqrt() + a.center.y
+        };
+        let (x0, x1) = (a.x_range[0], a.x_range[1]);
+        let left = to_mm(Vec2::new(x0, y_at(x0)));
+        let right = to_mm(Vec2::new(x1, y_at(x1)));
+        (r > 1e-6 && left.dist(right) > 1e-6).then_some((center, r, left, right, a.inliers, a.points))
+    });
+    if holes_mm.is_empty() && arc_mm.is_none() {
+        return Err(bad(cmd, "no lightening hole and no lower edge found (check the scale and `holes`, or take the photo closer and square-on)"));
+    }
+    // The sketch.
+    let name = str_(p, "name").unwrap_or("Skin");
+    let cp = json!({"plane": p.get("plane").cloned().unwrap_or(json!("XY")), "project_edges": false, "name": name});
+    let r = (super::find_command("sketch.create").ok_or_else(|| bad(cmd, "sketch.create"))?.run)(s, &cp)?;
+    let sketch = r.get("sketch").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "sketch.create gave no sketch"))?;
+    let (n_curves, _) = edit(s, p, cmd, false, |sk, _| {
+        let mut n = 0;
+        if let Some((center, _r, left, right, _, _)) = arc_mm {
+            // Counter-clockwise from the right end, under the centre, to the left end.
+            sk.add_arc(center, right, left, [None, None, None], None)?;
+            n += 1;
+        }
+        for (c, d, _, _) in &holes_mm {
+            sk.add_circle(*c, d / 2.0, None, None)?;
+            n += 1;
+        }
+        Ok(n)
+    })?;
+    (super::find_command("sketch.finish").ok_or_else(|| bad(cmd, "sketch.finish"))?.run)(s, &json!({}))?;
+    Ok(json!({
+        "sketch": sketch, "curves": n_curves,
+        "arc": arc_mm.map(|(c, r, l, rt, inl, pts)| json!({"center": pt(c), "radius": r, "start": pt(rt), "end": pt(l), "inliers": inl, "points": pts})),
+        "holes": holes_mm.iter().map(|(c, d, px, cov)| json!({"center": pt(*c), "diameter": d, "center_px": pt(*px), "coverage": cov})).collect::<Vec<_>>(),
+        "mm_per_pixel": k_photo, "origin_px": pt(origin_px), "width_px": ow, "height_px": oh,
     }))
 }
 

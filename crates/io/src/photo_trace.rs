@@ -52,11 +52,14 @@ pub struct TraceOptions {
     pub max_area_px: usize,
     /// Douglas–Peucker tolerance for the outlines, in pixels.
     pub simplify_px: f64,
+    /// Grow every mark by this many pixels all round before labelling (closes small gaps in
+    /// a drawn line); 0 for none.
+    pub grow_px: usize,
 }
 
 impl Default for TraceOptions {
     fn default() -> Self {
-        TraceOptions { threshold: 0.5, invert: false, despeckle: true, min_area_px: 16, max_area_px: usize::MAX, simplify_px: 1.0 }
+        TraceOptions { threshold: 0.5, invert: false, despeckle: true, min_area_px: 16, max_area_px: usize::MAX, simplify_px: 1.0, grow_px: 0 }
     }
 }
 
@@ -169,6 +172,9 @@ pub fn trace_luma(w: u32, h: u32, luma: &[u8], o: &TraceOptions) -> Result<Trace
     if o.despeckle {
         mask = majority(wi, hi, &mask);
     }
+    if o.grow_px > 0 {
+        mask = grow(wi, hi, &mask, o.grow_px.min(64));
+    }
     let regions = components(wi, hi, &mask, o.min_area_px.max(1), o.max_area_px)?;
     let mut out = Vec::new();
     for comp in regions.into_iter().take(MAX_REGIONS) {
@@ -183,6 +189,52 @@ pub fn trace_luma(w: u32, h: u32, luma: &[u8], o: &TraceOptions) -> Result<Trace
         out.push(TraceRegion { area_px: comp.area, bbox: comp.bbox, outline });
     }
     Ok(Trace { width: w, height: h, regions: out })
+}
+
+/// Every mark grown by `r` pixels along both axes (a square dilation, separable).
+fn grow(w: usize, h: usize, mask: &[bool], r: usize) -> Vec<bool> {
+    let mut rows = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let lo = x.saturating_sub(r);
+            let hi = (x + r).min(w - 1);
+            if (lo..=hi).any(|i| mask.get(y * w + i).copied().unwrap_or(false))
+                && let Some(o) = rows.get_mut(y * w + x)
+            {
+                *o = true;
+            }
+        }
+    }
+    let mut out = vec![false; w * h];
+    for y in 0..h {
+        let lo = y.saturating_sub(r);
+        let hi = (y + r).min(h - 1);
+        for x in 0..w {
+            if (lo..=hi).any(|j| rows.get(j * w + x).copied().unwrap_or(false))
+                && let Some(o) = out.get_mut(y * w + x)
+            {
+                *o = true;
+            }
+        }
+    }
+    out
+}
+
+/// The median luminance (0 … 1 of white) of an image.
+pub fn median_luma(luma: &[u8]) -> f64 {
+    let mut hist = [0usize; 256];
+    for &v in luma {
+        hist[usize::from(v)] += 1;
+    }
+    let half = luma.len() / 2;
+    let mut seen = 0usize;
+    hist.iter()
+        .position(|&n| {
+            seen += n;
+            seen > half
+        })
+        .unwrap_or(128) as f64
+        / 255.0
 }
 
 /// Specks go, pinholes fill, corners stay: a mark with fewer than two marked neighbours (of
@@ -530,21 +582,7 @@ pub fn blobs(w: u32, h: u32, luma: &[u8], o: &BlobOptions) -> Result<Vec<Blob>, 
     }
     let area = |d: f64| std::f64::consts::PI * d * d / 4.0;
     // The photo's median brightness, for the adaptive cuts.
-    let median = {
-        let mut hist = [0usize; 256];
-        for &v in luma {
-            hist[usize::from(v)] += 1;
-        }
-        let half = luma.len() / 2;
-        let mut seen = 0usize;
-        hist.iter()
-            .position(|&n| {
-                seen += n;
-                seen > half
-            })
-            .unwrap_or(128) as f64
-            / 255.0
-    };
+    let median = median_luma(luma);
     // What counts as dark around a light mark (the ring test).
     let dark_cut = (o.threshold.unwrap_or(median / 2.0) * 255.0).round() as i32;
     let mut out = Vec::new();
@@ -571,6 +609,7 @@ pub fn blobs(w: u32, h: u32, luma: &[u8], o: &BlobOptions) -> Result<Vec<Blob>, 
                 min_area_px: (area(d0) * 0.5).floor().max(1.0) as usize,
                 max_area_px: (area(d1) * 2.0).ceil() as usize,
                 simplify_px: 0.0,
+                grow_px: 0,
             },
         )?;
         for r in t.regions {
@@ -873,6 +912,34 @@ mod tests {
         assert!(map_point(&inv, mid).unwrap().dist(Vec2::new(900.0, 300.0)) < 1e-6);
         // Three points in line have no homography.
         assert!(homography([Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(2.0, 0.0), Vec2::new(0.0, 1.0)], to).is_none());
+    }
+
+    #[test]
+    fn growing_closes_a_gap_in_a_drawn_box() {
+        // A 2-px pen rectangle with a 3-px gap in its top edge: ungrown it is a C whose outer
+        // loop runs inside too; grown by 2 px it is a closed ring whose outer loop is the box.
+        let (w, h) = (120u32, 80u32);
+        let mut luma = vec![220u8; (w * h) as usize];
+        for x in 20..100 {
+            for y in [20u32, 21, 60, 61] {
+                if y <= 21 && (55..58).contains(&x) {
+                    continue;
+                }
+                luma[(y * w + x) as usize] = 20;
+            }
+        }
+        for y in 20..62 {
+            for x in [20u32, 21, 98, 99] {
+                luma[(y * w + x) as usize] = 20;
+            }
+        }
+        let o = TraceOptions { despeckle: false, simplify_px: 1.0, ..Default::default() };
+        let open = trace_luma(w, h, &luma, &o).unwrap();
+        assert!(polygon_area(&open.regions[0].outline).abs() < 80.0 * 42.0 * 0.5, "a C traces as a thin shape");
+        let closed = trace_luma(w, h, &luma, &TraceOptions { grow_px: 2, ..o }).unwrap();
+        let a = polygon_area(&closed.regions[0].outline).abs();
+        assert!((a - 84.0 * 46.0).abs() < 84.0 * 46.0 * 0.03, "{a}");
+        assert!((median_luma(&luma) - 220.0 / 255.0).abs() < 1e-9);
     }
 
     #[test]
