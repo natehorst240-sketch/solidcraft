@@ -248,7 +248,7 @@ fn components(w: usize, h: usize, mask: &[bool], min_area: usize) -> Vec<Compone
         }
         out.push(Component { area: pixels.len(), bbox, edges });
     }
-    out.sort_by(|a, b| b.area.cmp(&a.area));
+    out.sort_by_key(|c| std::cmp::Reverse(c.area));
     out
 }
 

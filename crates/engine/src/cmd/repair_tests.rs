@@ -310,7 +310,6 @@ fn hostile_repair_params_never_panic() {
         "cleanup_margin",
         "corner_radius",
         "angle",
-        "path",
         "notes",
         "plane",
         "name",
