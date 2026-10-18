@@ -31,7 +31,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          origin?: center (default: the chosen mark's centre is 0,0) | image (the photo's bottom-left) | [px,py]; region?: index | at?: [px,py] (which mark is `chosen`) \
          → {width_px, height_px, mm_per_pixel, chosen, regions: [{area_mm2, bbox, outline: [[x,y], …] mm, y up, counter-clockwise}]}",
     ),
-    CommandSpec::new("repair.doubler", "Repair Doubler", doubler).at("SHEET METAL", "CREATE").icon("flat").noundo().doc_only().params(concat!(
+    CommandSpec::new("repair.doubler", "Repair Doubler", doubler).at("SHEET METAL", "CREATE").icon("flat").noundo().doc_only().params(
         "damage: [[x,y], …] mm (the damaged area's outline, 3 or more points) | photo: {the parameters of repair.trace_photo; region? or at? picks the mark, default the largest}; \
          thickness?: mm (the skin and doubler, default 1); rivet_diameter?: mm (default 3.2); edge_distance?: mm (default 2.5 × diameter); \
          pitch?: mm (along a row, default 5 × diameter); row_pitch?: mm (between rows, default 0.75 × pitch); rows?: 1…10 (default 2); stagger?: bool (default true); \
@@ -40,11 +40,11 @@ pub static COMMANDS: &[CommandSpec] = &[
          path?: DXF file to write (else the DXF text is returned), notes?: bool (a note on layer NOTES, default true) \
          → {cutout, doubler: {type: circle|rounded_rectangle, center, angle_deg, width, height, radius, segments}, rivets: [[x,y], …], rivet_diameter, rows: [{offset, count, pitch}], damage: {points, area}, dxf | path}; \
          DXF layers: DOUBLER (the plate's outline), RIVET (its holes), CUTOUT (dashed: what to trim out of the skin), DAMAGE (dashed: the damage as given), NOTES"
-    )),
-    CommandSpec::new("repair.doubler_sketch", "Repair Doubler Sketch", doubler_sketch).at("SHEET METAL", "CREATE").icon("flat").params(concat!(
+    ),
+    CommandSpec::new("repair.doubler_sketch", "Repair Doubler Sketch", doubler_sketch).at("SHEET METAL", "CREATE").icon("flat").params(
         "the parameters of repair.doubler, drawn as a sketch (the plate's outline and its rivet holes): plane? (when no sketch is active, a new sketch on it; default XY), name? (default Doubler), at?: [x,y] offset; \
          sheet.flange {sketch, profiles: [{point: profile_point}]} makes the plate with its holes, sheet.export_dxf its flat pattern → {sketch, created_sketch, curves, rivets, size, profile_point: [x,y] on the plate}"
-    )),
+    ),
 ];
 
 /// The clean-out, a rivet row's line or the doubler's edge: a circle or a rectangle with
