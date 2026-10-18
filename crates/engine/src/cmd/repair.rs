@@ -29,7 +29,8 @@ pub static COMMANDS: &[CommandSpec] = &[
          scale: mm_per_pixel | width_mm (the photo's real width) | calibrate: {a: [px,py], b: [px,py], distance: mm} (two points a known distance apart); \
          min_area?: mm² (marks smaller are noise, default 1); simplify?: mm (outline tolerance, default 0.5); \
          origin?: center (default: the chosen mark's centre is 0,0) | image (the photo's bottom-left) | [px,py]; region?: index | at?: [px,py] (which mark is `chosen`) \
-         → {width_px, height_px, mm_per_pixel, chosen, regions: [{area_mm2, bbox, outline: [[x,y], …] mm, y up, counter-clockwise}]}",
+         (pixel coordinates are always the photo's own; a photo over 4096 px on an edge is traced on a coarser grid, downsampled_by) \
+         → {width_px, height_px, mm_per_pixel, downsampled_by, chosen, regions: [{area_mm2, bbox, outline: [[x,y], …] mm, y up, counter-clockwise}]}",
     ),
     CommandSpec::new("repair.doubler", "Repair Doubler", doubler).at("SHEET METAL", "CREATE").icon("flat").noundo().doc_only().params(
         "damage: [[x,y], …] mm (the damaged area's outline, 3 or more points) | photo: {the parameters of repair.trace_photo; region? or at? picks the mark, default the largest}; \
@@ -646,13 +647,18 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
     let despeckle = bool_(p, "despeckle").unwrap_or(true);
     let min_area = mm(p, "min_area", cmd, 1.0, 0.0, 1e9)?;
     let simplify = mm(p, "simplify", cmd, 0.5, 0.0, 1000.0)?;
-    let (w, h, luma) = photo_trace::decode_luma(&bytes).map_err(|e| bad(cmd, e.to_string()))?;
-    // The scale: mm per pixel.
-    let k = if let Some(k) = p.get("mm_per_pixel").filter(|v| !v.is_null()) {
+    let photo = photo_trace::decode_luma(&bytes).map_err(|e| bad(cmd, e.to_string()))?;
+    // Every pixel coordinate given or returned is in the photo's own pixels; a large photo is
+    // traced on a grid `f` times coarser.
+    let f = f64::from(photo.downsampled_by);
+    let (w, h, luma) = (photo.width, photo.height, &photo.luma);
+    let [ow, oh] = photo.original;
+    // The scale: mm per photo pixel.
+    let k_photo = if let Some(k) = p.get("mm_per_pixel").filter(|v| !v.is_null()) {
         k.as_f64().filter(|k| k.is_finite() && *k > 1e-6 && *k < 1e4).ok_or_else(|| bad(cmd, "`mm_per_pixel` must be a positive number"))?
     } else if let Some(wm) = p.get("width_mm").filter(|v| !v.is_null()) {
         let wm = wm.as_f64().filter(|w| w.is_finite() && *w > 1e-3 && *w < 1e7).ok_or_else(|| bad(cmd, "`width_mm` must be a positive number"))?;
-        wm / f64::from(w)
+        wm / f64::from(ow)
     } else if let Some(c) = p.get("calibrate").filter(|v| !v.is_null()) {
         let a = c.get("a").and_then(vec2).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`calibrate.a` must be [px, py]"))?;
         let b = c.get("b").and_then(vec2).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`calibrate.b` must be [px, py]"))?;
@@ -666,9 +672,11 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
     } else {
         return Err(bad(cmd, "give the scale: `mm_per_pixel`, `width_mm` or `calibrate: {a, b, distance}`"));
     };
+    // mm per grid pixel.
+    let k = k_photo * f;
     let o =
         TraceOptions { threshold, invert, despeckle, min_area_px: ((min_area / (k * k)).ceil().clamp(1.0, 1e9)) as usize, simplify_px: simplify / k };
-    let t = photo_trace::trace_luma(w, h, &luma, &o).map_err(|e| bad(cmd, e.to_string()))?;
+    let t = photo_trace::trace_luma(w, h, luma, &o).map_err(|e| bad(cmd, e.to_string()))?;
     // Which mark: by index, by a pixel on it, or the largest.
     let chosen = if let Some(r) = p.get("region").filter(|v| !v.is_null()) {
         let i = r.as_u64().ok_or_else(|| bad(cmd, "`region` must be an index"))? as usize;
@@ -677,7 +685,7 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
         }
         i
     } else if let Some(at) = p.get("at").filter(|v| !v.is_null()) {
-        let q = vec2(at).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`at` must be [px, py]"))?;
+        let q = vec2(at).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`at` must be [px, py]"))? * (1.0 / f);
         t.regions
             .iter()
             .position(|r| r.bbox[0] <= q.x && q.x <= r.bbox[2] && r.bbox[1] <= q.y && q.y <= r.bbox[3] && Loop2::polygon(&r.outline).contains(q))
@@ -690,7 +698,7 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
         None => None,
         Some(Value::String(s)) if s.eq_ignore_ascii_case("center") => None,
         Some(Value::String(s)) if s.eq_ignore_ascii_case("image") => Some(Vec2::new(0.0, f64::from(h))),
-        Some(v) => Some(vec2(v).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`origin` must be center, image or [px, py]"))?),
+        Some(v) => Some(vec2(v).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`origin` must be center, image or [px, py]"))? * (1.0 / f)),
     };
     let origin = origin.unwrap_or_else(|| {
         t.regions
@@ -713,7 +721,8 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
         })
         .collect();
     Ok(json!({
-        "width_px": w, "height_px": h, "mm_per_pixel": k, "width_mm": f64::from(w) * k, "height_mm": f64::from(h) * k,
+        "width_px": ow, "height_px": oh, "mm_per_pixel": k_photo, "downsampled_by": photo.downsampled_by,
+        "width_mm": f64::from(ow) * k_photo, "height_mm": f64::from(oh) * k_photo,
         "chosen": chosen, "regions": regions,
     }))
 }

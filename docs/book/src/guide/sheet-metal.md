@@ -327,7 +327,9 @@ can come straight from a photograph of the skin with the damage marked up.
    `calibrate: {a, b, distance}` with two pixels a known distance apart). Dark marks on a light
    skin are the default; `invert: true` reads light marks on a dark one. `threshold` and
    `min_area` tune what counts as a mark, `simplify` how fine the polygon is. The largest mark
-   is `chosen`; `region` (an index) or `at` (a pixel on the mark) picks another.
+   is `chosen`; `region` (an index) or `at` (a pixel on the mark) picks another. Pixel
+   coordinates are always the photo's own (as an image editor shows them); a phone-sized photo
+   is traced on a coarser grid, reported as `downsampled_by`.
 3. `repair.doubler` designs the repair from `damage` (a polygon in mm) or from `photo` (the
    parameters above, traced in one go): the clean-out `cutout` (the smallest rectangle around the
    damage with rounded corners, or a circle, plus `cleanup_margin`), the rivet `rows` with their

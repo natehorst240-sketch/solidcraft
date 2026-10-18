@@ -415,3 +415,33 @@ fn rivets_on_a_curved_row_never_overlap() {
         .contains("pitch")
     );
 }
+
+#[test]
+fn a_phone_sized_photo_keeps_its_own_pixel_coordinates() {
+    // 8200 × 10 px, a 600 px wide black block from x = 100: traced 3 × coarser, but every input
+    // and output is in the photo's pixels.
+    let (w, h) = (8200u32, 10u32);
+    let mut luma = vec![255u8; (w * h) as usize];
+    for y in 0..h {
+        for x in 100..700 {
+            luma[(y * w + x) as usize] = 0;
+        }
+    }
+    let data = solidcraft_doc::canvas::base64_encode(&gray_png(w, h, &luma).unwrap());
+    let mut s = Session::default();
+    // Two pixels 8200 apart are 820 mm apart: 0.1 mm per photo pixel.
+    let t = run(
+        &mut s,
+        "repair.trace_photo",
+        json!({"data": data, "calibrate": {"a": [0, 5], "b": [8200, 5], "distance": 820}, "origin": "image", "despeckle": false}),
+    );
+    assert_eq!((t["width_px"].as_u64(), t["height_px"].as_u64(), t["downsampled_by"].as_u64()), (Some(8200), Some(10), Some(3)));
+    assert!((t["mm_per_pixel"].as_f64().unwrap() - 0.1).abs() < 1e-12);
+    let r = &t["regions"][0];
+    // The block is 60 mm wide starting 10 mm in (to within one coarse pixel, 0.3 mm).
+    let bbox = r["bbox"].as_array().unwrap();
+    assert!((bbox[0].as_f64().unwrap() - 10.0).abs() < 0.31 && (bbox[2].as_f64().unwrap() - 70.0).abs() < 0.31, "{bbox:?}");
+    // `at` in photo pixels finds it.
+    assert_eq!(run(&mut s, "repair.trace_photo", json!({"data": data, "mm_per_pixel": 0.1, "at": [400, 5], "despeckle": false}))["chosen"], 0);
+    assert!(fails(&mut s, "repair.trace_photo", json!({"data": data, "mm_per_pixel": 0.1, "at": [4000, 5], "despeckle": false})).contains("no mark"));
+}

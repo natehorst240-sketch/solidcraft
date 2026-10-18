@@ -18,11 +18,13 @@ use solidcraft_geom::Vec2;
 
 /// The most bytes a photo may have.
 pub const MAX_PHOTO_BYTES: usize = 16 << 20;
-/// The longest image edge, in pixels.
+/// The longest edge of the traced luminance grid, in pixels; larger photos are downsampled to it.
 pub const MAX_PHOTO_EDGE: u32 = 4096;
+/// The longest photo edge the decoder accepts at all.
+pub const MAX_DECODE_EDGE: u32 = 12_000;
 /// The most regions a trace reports (the largest first).
 pub const MAX_REGIONS: usize = 64;
-const MAX_CODEC_BYTES: u64 = 256 << 20;
+const MAX_CODEC_BYTES: u64 = 640 << 20;
 /// The most boundary edges the kept regions may have between them (a 4096² image of 1-pixel
 /// lines could otherwise cost gigabytes).
 pub const MAX_BOUNDARY_EDGES: usize = 4_000_000;
@@ -75,8 +77,25 @@ pub struct Trace {
     pub regions: Vec<TraceRegion>,
 }
 
-/// The luminance of a PNG or JPEG, one byte per pixel, row-major from the top-left.
-pub fn decode_luma(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), TraceError> {
+/// A decoded photo's luminance, downsampled when the photo is larger than [`MAX_PHOTO_EDGE`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Photo {
+    /// The luminance grid's size (after any downsampling).
+    pub width: u32,
+    pub height: u32,
+    /// One byte per pixel, row-major from the top-left.
+    pub luma: Vec<u8>,
+    /// Each luminance pixel covers `downsampled_by × downsampled_by` pixels of the photo
+    /// (1: none). Coordinates in the photo's own pixels divide by this.
+    pub downsampled_by: u32,
+    /// The photo's own size in pixels.
+    pub original: [u32; 2],
+}
+
+/// The luminance of a PNG or JPEG. A photo with an edge over [`MAX_PHOTO_EDGE`] pixels (a phone
+/// camera's) is box-averaged down by the smallest whole factor that fits, so callers keep
+/// working in the photo's own pixel coordinates (see [`Photo::downsampled_by`]).
+pub fn decode_luma(bytes: &[u8]) -> Result<Photo, TraceError> {
     if bytes.is_empty() || bytes.len() > MAX_PHOTO_BYTES {
         return Err(TraceError::Invalid(format!("the photo must be 1 byte to {} MiB", MAX_PHOTO_BYTES >> 20)));
     }
@@ -87,8 +106,8 @@ pub fn decode_luma(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), TraceError> {
     let decoded = std::panic::catch_unwind(|| {
         let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
         let mut limits = Limits::default();
-        limits.max_image_width = Some(MAX_PHOTO_EDGE);
-        limits.max_image_height = Some(MAX_PHOTO_EDGE);
+        limits.max_image_width = Some(MAX_DECODE_EDGE);
+        limits.max_image_height = Some(MAX_DECODE_EDGE);
         limits.max_alloc = Some(MAX_CODEC_BYTES);
         reader.limits(limits);
         reader.decode().map(|img| img.into_luma8())
@@ -96,20 +115,39 @@ pub fn decode_luma(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), TraceError> {
     .map_err(|_| TraceError::Image("the image decoder failed".into()))?
     .map_err(|e| TraceError::Image(e.to_string()))?;
     let (w, h) = decoded.dimensions();
-    if w == 0 || h == 0 || w > MAX_PHOTO_EDGE || h > MAX_PHOTO_EDGE {
-        return Err(TraceError::Invalid(format!("the photo must be at most {MAX_PHOTO_EDGE} × {MAX_PHOTO_EDGE} pixels")));
+    if w == 0 || h == 0 || w > MAX_DECODE_EDGE || h > MAX_DECODE_EDGE {
+        return Err(TraceError::Invalid(format!("the photo must be at most {MAX_DECODE_EDGE} × {MAX_DECODE_EDGE} pixels")));
     }
     let px = decoded.into_raw();
     if px.len() != (w as usize) * (h as usize) {
         return Err(TraceError::Image("the decoded image has the wrong size".into()));
     }
-    Ok((w, h, px))
+    let f = w.max(h).div_ceil(MAX_PHOTO_EDGE).max(1);
+    if f == 1 {
+        return Ok(Photo { width: w, height: h, luma: px, downsampled_by: 1, original: [w, h] });
+    }
+    let (sw, sh) = (w.div_ceil(f), h.div_ceil(f));
+    let (wi, fi) = (w as usize, f as usize);
+    let mut luma = Vec::with_capacity((sw as usize) * (sh as usize));
+    for sy in 0..sh as usize {
+        for sx in 0..sw as usize {
+            let (mut sum, mut n) = (0u32, 0u32);
+            for y in sy * fi..((sy + 1) * fi).min(h as usize) {
+                for x in sx * fi..((sx + 1) * fi).min(wi) {
+                    sum += u32::from(px.get(y * wi + x).copied().unwrap_or(255));
+                    n += 1;
+                }
+            }
+            luma.push(sum.checked_div(n).map_or(255, |v| v as u8));
+        }
+    }
+    Ok(Photo { width: sw, height: sh, luma, downsampled_by: f, original: [w, h] })
 }
 
-/// The marked regions of a photo.
+/// The marked regions of a photo (in the luminance grid's pixels: see [`Photo::downsampled_by`]).
 pub fn trace(bytes: &[u8], o: &TraceOptions) -> Result<Trace, TraceError> {
-    let (w, h, luma) = decode_luma(bytes)?;
-    trace_luma(w, h, &luma, o)
+    let photo = decode_luma(bytes)?;
+    trace_luma(photo.width, photo.height, &photo.luma, o)
 }
 
 /// The marked regions of a luminance image (`luma` is `w × h` bytes, row-major, top-left first).
@@ -582,6 +620,28 @@ mod tests {
         }
         let err = trace_luma(n as u32, n as u32, &luma, &o).unwrap_err();
         assert!(err.to_string().contains("intricate"), "{err}");
+    }
+
+    #[test]
+    fn a_large_photo_is_downsampled_and_keeps_its_marks() {
+        // 8200 × 10 with a black block over columns 100..700: downsampled by 3 to 2734 × 4.
+        let (w, h) = (8200u32, 10u32);
+        let mut luma = vec![255u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 100..700 {
+                luma[(y * w + x) as usize] = 0;
+            }
+        }
+        let photo = decode_luma(&gray_png(w, h, &luma).unwrap()).unwrap();
+        assert_eq!((photo.downsampled_by, photo.original, photo.width, photo.height), (3, [8200, 10], 2734, 4));
+        let t = trace_luma(photo.width, photo.height, &photo.luma, &TraceOptions { despeckle: false, ..Default::default() }).unwrap();
+        assert_eq!(t.regions.len(), 1);
+        // Columns 33 (two thirds black) to 232 inclusive, all four rows.
+        assert_eq!(t.regions[0].area_px, 200 * 4);
+        assert_eq!(t.regions[0].bbox, [33.0, 0.0, 233.0, 4.0]);
+        // Within the limit nothing changes.
+        let small = decode_luma(&gray_png(4096, 2, &[0; 8192]).unwrap()).unwrap();
+        assert_eq!((small.downsampled_by, small.width), (1, 4096));
     }
 
     #[test]
