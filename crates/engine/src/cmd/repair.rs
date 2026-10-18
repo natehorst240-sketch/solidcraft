@@ -30,7 +30,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          min_area?: mm² (marks smaller are noise, default 1); simplify?: mm (outline tolerance, default 0.5); \
          origin?: center (default: the chosen mark's centre is 0,0) | image (the photo's bottom-left) | [px,py]; region?: index | at?: [px,py] (which mark is `chosen`) \
          (pixel coordinates are always the photo's own; a photo over 4096 px on an edge is traced on a coarser grid, downsampled_by) \
-         → {width_px, height_px, mm_per_pixel, downsampled_by, chosen, regions: [{area_mm2, bbox, outline: [[x,y], …] mm, y up, counter-clockwise}]}",
+         → {width_px, height_px, mm_per_pixel, downsampled_by, chosen, regions: [{area_mm2, bbox, outline: [[x,y], …] mm, y up, counter-clockwise; bbox_px, center_px: where the mark is in the photo's pixels}]}",
     ),
     CommandSpec::new("repair.doubler", "Repair Doubler", doubler).at("SHEET METAL", "CREATE").icon("flat").noundo().doc_only().params(
         "damage: [[x,y], …] mm (the damaged area's outline, 3 or more points) | photo: {the parameters of repair.trace_photo; region? or at? picks the mark, default the largest}; \
@@ -716,6 +716,8 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
                 "area_mm2": r.area_px as f64 * k * k,
                 "area_px": r.area_px,
                 "bbox": [lo.x, lo.y, hi.x, hi.y],
+                "bbox_px": [r.bbox[0] * f, r.bbox[1] * f, r.bbox[2] * f, r.bbox[3] * f],
+                "center_px": [(r.bbox[0] + r.bbox[2]) / 2.0 * f, (r.bbox[1] + r.bbox[3]) / 2.0 * f],
                 "outline": r.outline.iter().map(|q| pt(to_mm(*q))).collect::<Vec<_>>(),
             })
         })

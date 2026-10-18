@@ -441,6 +441,10 @@ fn a_phone_sized_photo_keeps_its_own_pixel_coordinates() {
     // The block is 60 mm wide starting 10 mm in (to within one coarse pixel, 0.3 mm).
     let bbox = r["bbox"].as_array().unwrap();
     assert!((bbox[0].as_f64().unwrap() - 10.0).abs() < 0.31 && (bbox[2].as_f64().unwrap() - 70.0).abs() < 0.31, "{bbox:?}");
+    // Where the mark is, in the photo's pixels.
+    let bpx = r["bbox_px"].as_array().unwrap();
+    assert!((bpx[0].as_f64().unwrap() - 99.0).abs() < 1e-9 && (bpx[2].as_f64().unwrap() - 699.0).abs() < 1e-9, "{bpx:?}");
+    assert!((r["center_px"][0].as_f64().unwrap() - 399.0).abs() < 1e-9);
     // `at` in photo pixels finds it.
     assert_eq!(run(&mut s, "repair.trace_photo", json!({"data": data, "mm_per_pixel": 0.1, "at": [400, 5], "despeckle": false}))["chosen"], 0);
     assert!(fails(&mut s, "repair.trace_photo", json!({"data": data, "mm_per_pixel": 0.1, "at": [4000, 5], "despeckle": false})).contains("no mark"));
