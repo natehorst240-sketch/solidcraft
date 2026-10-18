@@ -23,6 +23,9 @@ pub const MAX_PHOTO_EDGE: u32 = 4096;
 /// The most regions a trace reports (the largest first).
 pub const MAX_REGIONS: usize = 64;
 const MAX_CODEC_BYTES: u64 = 256 << 20;
+/// The most boundary edges the kept regions may have between them (a 4096² image of 1-pixel
+/// lines could otherwise cost gigabytes).
+pub const MAX_BOUNDARY_EDGES: usize = 4_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TraceError {
@@ -126,7 +129,7 @@ pub fn trace_luma(w: u32, h: u32, luma: &[u8], o: &TraceOptions) -> Result<Trace
     if o.despeckle {
         mask = majority(wi, hi, &mask);
     }
-    let regions = components(wi, hi, &mask, o.min_area_px.max(1));
+    let regions = components(wi, hi, &mask, o.min_area_px.max(1))?;
     let mut out = Vec::new();
     for comp in regions.into_iter().take(MAX_REGIONS) {
         let Some(outline) = outer_loop(&comp.edges) else { continue };
@@ -180,11 +183,13 @@ struct Component {
     edges: Vec<(Vec2, Vec2)>,
 }
 
-fn components(w: usize, h: usize, mask: &[bool], min_area: usize) -> Vec<Component> {
+fn components(w: usize, h: usize, mask: &[bool], min_area: usize) -> Result<Vec<Component>, TraceError> {
     let mut label = vec![0u32; w * h];
-    let mut out: Vec<Component> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     let is_set = |i: usize| mask.get(i).copied().unwrap_or(false);
+    // Pass 1: label every component and keep only the largest `MAX_REGIONS` (by pixel count),
+    // so a field of specks never costs more than its label map.
+    let mut kept: Vec<(usize, u32)> = Vec::new();
     let mut next = 1u32;
     for start in 0..w * h {
         if !is_set(start) || label.get(start).copied().unwrap_or(1) != 0 {
@@ -197,9 +202,9 @@ fn components(w: usize, h: usize, mask: &[bool], min_area: usize) -> Vec<Compone
         if let Some(l) = label.get_mut(start) {
             *l = id;
         }
-        let mut pixels: Vec<usize> = Vec::new();
+        let mut area = 0usize;
         while let Some(i) = stack.pop() {
-            pixels.push(i);
+            area += 1;
             let (x, y) = (i % w, i / w);
             let mut visit = |j: usize| {
                 if is_set(j) && label.get(j).copied().unwrap_or(1) == 0 {
@@ -222,34 +227,56 @@ fn components(w: usize, h: usize, mask: &[bool], min_area: usize) -> Vec<Compone
                 visit(i + w);
             }
         }
-        if pixels.len() < min_area {
+        if area < min_area {
             continue;
         }
-        let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-        let mut edges = Vec::new();
-        let same = |j: usize| label.get(j).copied().unwrap_or(0) == id;
-        for &i in &pixels {
-            let (x, y) = (i % w, i / w);
-            let (fx, fy) = (x as f64, y as f64);
-            bbox = [bbox[0].min(fx), bbox[1].min(fy), bbox[2].max(fx + 1.0), bbox[3].max(fy + 1.0)];
-            let (p00, p10, p11, p01) = (Vec2::new(fx, fy), Vec2::new(fx + 1.0, fy), Vec2::new(fx + 1.0, fy + 1.0), Vec2::new(fx, fy + 1.0));
-            if y == 0 || !same(i - w) {
-                edges.push((p00, p10));
-            }
-            if x + 1 >= w || !same(i + 1) {
-                edges.push((p10, p11));
-            }
-            if y + 1 >= h || !same(i + w) {
-                edges.push((p11, p01));
-            }
-            if x == 0 || !same(i - 1) {
-                edges.push((p01, p00));
-            }
+        kept.push((area, id));
+        if kept.len() >= 2 * MAX_REGIONS {
+            kept.sort_by_key(|&(area, _)| std::cmp::Reverse(area));
+            kept.truncate(MAX_REGIONS);
         }
-        out.push(Component { area: pixels.len(), bbox, edges });
     }
-    out.sort_by_key(|c| std::cmp::Reverse(c.area));
-    out
+    kept.sort_by_key(|&(area, _)| std::cmp::Reverse(area));
+    kept.truncate(MAX_REGIONS);
+    let slot: HashMap<u32, usize> = kept.iter().enumerate().map(|(k, &(_, id))| (id, k)).collect();
+    let mut out: Vec<Component> = kept
+        .iter()
+        .map(|&(area, _)| Component { area, bbox: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], edges: Vec::new() })
+        .collect();
+    // Pass 2: the boxes and boundary edges of the kept components, in one sweep; the edge total
+    // is capped so a maze-like mark cannot exhaust memory.
+    let mut edges_total = 0usize;
+    for i in 0..w * h {
+        let id = label.get(i).copied().unwrap_or(0);
+        if id == 0 {
+            continue;
+        }
+        let Some(&k) = slot.get(&id) else { continue };
+        let Some(comp) = out.get_mut(k) else { continue };
+        let (x, y) = (i % w, i / w);
+        let (fx, fy) = (x as f64, y as f64);
+        comp.bbox = [comp.bbox[0].min(fx), comp.bbox[1].min(fy), comp.bbox[2].max(fx + 1.0), comp.bbox[3].max(fy + 1.0)];
+        let same = |j: usize| label.get(j).copied().unwrap_or(0) == id;
+        let (p00, p10, p11, p01) = (Vec2::new(fx, fy), Vec2::new(fx + 1.0, fy), Vec2::new(fx + 1.0, fy + 1.0), Vec2::new(fx, fy + 1.0));
+        let before = comp.edges.len();
+        if y == 0 || !same(i - w) {
+            comp.edges.push((p00, p10));
+        }
+        if x + 1 >= w || !same(i + 1) {
+            comp.edges.push((p10, p11));
+        }
+        if y + 1 >= h || !same(i + w) {
+            comp.edges.push((p11, p01));
+        }
+        if x == 0 || !same(i - 1) {
+            comp.edges.push((p01, p00));
+        }
+        edges_total += comp.edges.len() - before;
+        if edges_total > MAX_BOUNDARY_EDGES {
+            return Err(TraceError::Invalid("the marks are too intricate to trace (raise `min_area` or turn on `despeckle`)".into()));
+        }
+    }
+    Ok(out)
 }
 
 fn key(p: Vec2) -> (i64, i64) {
@@ -514,6 +541,47 @@ mod tests {
         assert!(trace_luma(2, 2, &[0; 4], &TraceOptions { simplify_px: -1.0, ..Default::default() }).is_err());
         let truncated = &gray_png(8, 8, &[0; 64]).unwrap()[..20];
         assert!(trace(truncated, &TraceOptions::default()).is_err());
+    }
+
+    #[test]
+    fn a_field_of_specks_keeps_only_the_largest_regions() {
+        // A 512 × 512 checkerboard of single pixels, no despeckle, every speck kept: bounded
+        // to MAX_REGIONS regions, plus one real mark that comes first.
+        let n = 512usize;
+        let mut luma = vec![255u8; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                if (x + y) % 2 == 0 {
+                    luma[y * n + x] = 0;
+                }
+            }
+        }
+        for y in 100..140 {
+            for x in 100..160 {
+                luma[y * n + x] = 0;
+            }
+        }
+        // No simplification either: a one-pixel speck would otherwise simplify away.
+        let o = TraceOptions { despeckle: false, min_area_px: 1, simplify_px: 0.0, ..Default::default() };
+        let t = trace_luma(n as u32, n as u32, &luma, &o).unwrap();
+        assert_eq!(t.regions.len(), MAX_REGIONS);
+        assert!(t.regions[0].area_px > 40 * 60);
+        assert!(t.regions.iter().skip(1).all(|r| r.area_px == 1));
+        // One serpentine 1-pixel line over the whole image (every other row, joined at
+        // alternate ends) is refused, not traced: its boundary would be millions of edges.
+        let n = 4096usize;
+        let mut luma = vec![255u8; n * n];
+        for y in 0..n {
+            if y % 2 == 0 {
+                for x in 0..n {
+                    luma[y * n + x] = 0;
+                }
+            } else {
+                luma[y * n + if y % 4 == 1 { n - 1 } else { 0 }] = 0;
+            }
+        }
+        let err = trace_luma(n as u32, n as u32, &luma, &o).unwrap_err();
+        assert!(err.to_string().contains("intricate"), "{err}");
     }
 
     #[test]

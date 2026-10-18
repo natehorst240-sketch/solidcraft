@@ -79,6 +79,38 @@ impl Shape {
         Shape { kind, ..self }
     }
 
+    /// A point in the shape's own frame.
+    fn to_local(self, p: Vec2) -> Vec2 {
+        let (s, c) = self.angle.sin_cos();
+        let q = p - self.center;
+        Vec2::new(q.x * c + q.y * s, -q.x * s + q.y * c)
+    }
+
+    /// Grows a rounded rectangle, about its centre, until every point is inside it: a rounded
+    /// rectangle is the inner rectangle (half sizes `a − r`, `b − r`) swept by a disc of `r`, so
+    /// a point is inside when it is within `r` of that inner rectangle. Circles are unchanged.
+    fn grow_to_contain(&mut self, pts: &[Vec2]) {
+        let Kind::Rounded { a, b, r } = &mut self.kind else { return };
+        let (center, angle) = (self.center, self.angle);
+        let local = |p: Vec2| Shape { center, angle, kind: Kind::Circle { r: 0.0 } }.to_local(p);
+        for _ in 0..3 {
+            let (ia, ib) = ((*a - *r).max(0.0), (*b - *r).max(0.0));
+            let outside = pts
+                .iter()
+                .map(|&p| {
+                    let q = local(p);
+                    let (dx, dy) = ((q.x.abs() - ia).max(0.0), (q.y.abs() - ib).max(0.0));
+                    (dx * dx + dy * dy).sqrt() - *r
+                })
+                .fold(0.0, f64::max);
+            if outside <= 1e-9 {
+                break;
+            }
+            *a += outside;
+            *b += outside;
+        }
+    }
+
     fn size(self) -> (f64, f64) {
         match self.kind {
             Kind::Circle { r } => (2.0 * r, 2.0 * r),
@@ -258,6 +290,12 @@ fn min_circle(h: &[Vec2]) -> Shape {
     Shape { center: c.0, angle: 0.0, kind: Kind::Circle { r: c.1 } }
 }
 
+/// The shortest straight distance between neighbouring points of a closed ring.
+fn min_chord(pts: &[Vec2]) -> f64 {
+    let n = pts.len();
+    (0..n).filter_map(|i| pts.get(i).zip(pts.get((i + 1) % n))).map(|(a, b)| a.dist(*b)).fold(f64::INFINITY, f64::min)
+}
+
 /// Points evenly along the loop, `n` of them, the first `phase` (0 … 1) of a step in.
 fn along(lp: &Loop2, n: usize, phase: f64) -> Vec<Vec2> {
     let lens: Vec<f64> = lp.segs.iter().map(Seg2::length).collect();
@@ -403,6 +441,8 @@ fn design(plan: Plan, damage: Vec<Vec2>, cmd: &str) -> Result<Doubler> {
     if let Kind::Rounded { a, b, r } = &mut cutout.kind {
         *r = plan.corner_radius.min(*a).min(*b);
     }
+    // Rounding the corners cuts inside the rectangle: grow it until the whole damage is inside.
+    cutout.grow_to_contain(&h);
     let (w, h) = cutout.size();
     if w > 1e5 || h > 1e5 {
         return Err(bad(cmd, "the damage is too large (100 m)"));
@@ -413,13 +453,29 @@ fn design(plan: Plan, damage: Vec<Vec2>, cmd: &str) -> Result<Doubler> {
         let d = plan.edge_distance + i as f64 * plan.row_pitch;
         let line = cutout.offset(d).outline();
         let len: f64 = line.segs.iter().map(Seg2::length).sum();
-        let n = ((len / plan.pitch).ceil() as usize).max(3);
+        let mut n = ((len / plan.pitch).ceil() as usize).max(3);
         total = total.saturating_add(n);
         if total > 5000 {
             return Err(bad(cmd, "more than 5000 rivets: raise `pitch` or lower `rows`"));
         }
         let phase = if plan.stagger && i % 2 == 1 { 0.5 } else { 0.0 };
-        rows.push((d, along(&line, n, phase), len / n as f64));
+        // Along a curve the holes sit closer than the developed spacing: fewer rivets until no
+        // two are nearer than twice the diameter, and never further apart than the pitch.
+        let mut pts = along(&line, n, phase);
+        while n > 3 && min_chord(&pts) < 2.0 * plan.rivet_diameter - 1e-9 {
+            n -= 1;
+            pts = along(&line, n, phase);
+        }
+        if len / n as f64 > plan.pitch + 1e-9 {
+            return Err(bad(
+                cmd,
+                format!(
+                    "row {}: rivets `pitch` apart would have holes closer than twice the diameter around the corners; raise `pitch` or `corner_radius`",
+                    i + 1
+                ),
+            ));
+        }
+        rows.push((d, pts, len / n as f64));
     }
     let last = plan.edge_distance + (plan.rows.saturating_sub(1)) as f64 * plan.row_pitch;
     let plate = cutout.offset(last + plan.edge_distance);

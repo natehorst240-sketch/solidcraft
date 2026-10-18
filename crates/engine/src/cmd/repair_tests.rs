@@ -270,7 +270,7 @@ fn bad_inputs_are_refused() {
         fails(
             &mut s,
             "repair.doubler",
-            json!({"damage": ok, "pitch": 6.4, "rows": 10, "rivet_diameter": 3.2, "row_pitch": 6.4, "cleanup_margin": 1000})
+            json!({"damage": ok, "pitch": 8, "rows": 10, "rivet_diameter": 3.2, "row_pitch": 6.4, "cleanup_margin": 1000})
         )
         .contains("5000")
     );
@@ -353,4 +353,65 @@ fn hostile_repair_params_never_panic() {
             }
         }
     }
+}
+
+#[test]
+fn a_rounded_cleanout_never_cuts_into_the_damage() {
+    let mut s = Session::default();
+    // No margin and the default 6 mm corners on a 10 × 10 square: the plain bounding box would lose the corners.
+    let square = json!([[0, 0], [10, 0], [10, 10], [0, 10]]);
+    let d = run(&mut s, "repair.doubler", json!({"damage": square, "cleanup_margin": 0, "rows": 1}));
+    let cutout = shape_loop(&d["cutout"]);
+    // With no margin the corners sit on the trim line itself (as they would on the plain box).
+    let inside = |lp: &Loop2, p: Vec2| lp.contains(p) || dist_to_loop(lp, p) < 1e-6;
+    for c in [Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)] {
+        assert!(inside(&cutout, c), "corner {c:?} outside {}", d["cutout"]);
+    }
+    // 6 mm corners on a 10 mm box make it a circle of radius 5, grown to reach the corners: 10√2 across.
+    assert!((d["cutout"]["width"].as_f64().unwrap() - 10.0 * 2f64.sqrt()).abs() < 1e-9, "{}", d["cutout"]);
+    // A large radius with a margin, on a tilted outline: every damage point stays inside.
+    let (sn, cs) = 20f64.to_radians().sin_cos();
+    let rot = |x: f64, y: f64| json!([x * cs - y * sn, x * sn + y * cs]);
+    let damage = json!([rot(-30.0, -8.0), rot(30.0, -8.0), rot(30.0, 8.0), rot(-30.0, 8.0), rot(0.0, 10.0)]);
+    let d = run(&mut s, "repair.doubler", json!({"damage": damage, "cleanup_margin": 2, "corner_radius": 40, "rows": 1}));
+    let cutout = shape_loop(&d["cutout"]);
+    for p in pts(&damage) {
+        assert!(inside(&cutout, p), "{p:?} outside {}", d["cutout"]);
+    }
+    // And without rounding the box is unchanged.
+    let d = run(&mut s, "repair.doubler", json!({"damage": square, "cleanup_margin": 0, "corner_radius": 0, "rows": 1}));
+    assert!((d["cutout"]["width"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+}
+
+#[test]
+fn rivets_on_a_curved_row_never_overlap() {
+    let mut s = Session::default();
+    // Around a circle the straight distance between neighbours is shorter than the developed spacing.
+    for pitch in [6.4, 7.0, 8.0, 12.0] {
+        let p = json!({"damage": [[0, 0], [10, 0], [10, 10], [0, 10]], "cutout": "circle", "rows": 2, "rivet_diameter": 3.2, "pitch": pitch, "row_pitch": 6.4});
+        match s.execute("repair.doubler", &p) {
+            Ok(d) => {
+                let rivets = pts(&d["rivets"]);
+                for (i, a) in rivets.iter().enumerate() {
+                    for b in rivets.iter().skip(i + 1) {
+                        assert!(a.dist(*b) >= 6.4 - 1e-9, "pitch {pitch}: {a:?} {b:?}");
+                    }
+                }
+                for r in d["rows"].as_array().unwrap() {
+                    assert!(r["pitch"].as_f64().unwrap() <= pitch + 1e-9);
+                }
+            }
+            Err(EngineError::Internal(_, m)) => panic!("{m}"),
+            Err(e) => assert!(e.to_string().contains("pitch"), "{e}"),
+        }
+    }
+    // The tightest allowed pitch on a round row cannot be met: refused, not overlapped.
+    assert!(
+        fails(
+            &mut s,
+            "repair.doubler",
+            json!({"damage": [[0, 0], [10, 0], [10, 10], [0, 10]], "cutout": "circle", "rows": 1, "rivet_diameter": 3.2, "pitch": 6.4})
+        )
+        .contains("pitch")
+    );
 }
