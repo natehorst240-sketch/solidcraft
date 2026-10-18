@@ -332,7 +332,7 @@ fn hostile_repair_params_never_panic() {
         json!({"photo": {"data": photo(), "mm_per_pixel": 0.5}}),
         json!({"data": photo(), "mm_per_pixel": 0.5}),
     ];
-    for id in ["repair.doubler", "repair.doubler_sketch", "repair.trace_photo"] {
+    for id in ["repair.doubler", "repair.doubler_sketch", "repair.trace_photo", "repair.skin_from_photo"] {
         for v in crate::tests::hostile_values() {
             for k in keys {
                 for b in &base {
@@ -448,4 +448,90 @@ fn a_phone_sized_photo_keeps_its_own_pixel_coordinates() {
     // `at` in photo pixels finds it.
     assert_eq!(run(&mut s, "repair.trace_photo", json!({"data": data, "mm_per_pixel": 0.1, "at": [400, 5], "despeckle": false}))["chosen"], 0);
     assert!(fails(&mut s, "repair.trace_photo", json!({"data": data, "mm_per_pixel": 0.1, "at": [4000, 5], "despeckle": false})).contains("no mark"));
+}
+
+/// A skin photographed at an angle: 1800 × 600 px, a strip whose corners are a known
+/// 228.6 × 50.8 mm rectangle seen in perspective, with 8 holes of Ø3.2 mm at known places,
+/// a bright rivet head, a pen line and a drawn digit.
+fn skin_photo() -> (String, [Vec2; 4], Vec<Vec2>) {
+    let (w, h) = (1800u32, 600u32);
+    let corners = [Vec2::new(100.0, 120.0), Vec2::new(1700.0, 80.0), Vec2::new(1760.0, 520.0), Vec2::new(60.0, 480.0)];
+    let rect = [Vec2::ZERO, Vec2::new(228.6, 0.0), Vec2::new(228.6, 50.8), Vec2::new(0.0, 50.8)];
+    let to_mm = solidcraft_io::photo_trace::homography(corners, rect).unwrap();
+    let holes: Vec<Vec2> = (0..8).map(|i| Vec2::new(20.0 + 25.0 * i as f64, 40.0)).collect(); // mm, y down
+    let head = Vec2::new(110.0, 12.0);
+    let mut luma = vec![190u8; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let px = Vec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
+            let Some(m) = solidcraft_io::photo_trace::map_point(&to_mm, px) else { continue };
+            let i = (y * w + x) as usize;
+            if holes.iter().any(|c| c.dist(m) <= 1.6) {
+                luma[i] = 15;
+            } else if head.dist(m) <= 1.6 {
+                luma[i] = 255;
+            } else if (m.y - 25.0).abs() < 0.3 && m.x > 5.0 && m.x < 223.0 {
+                luma[i] = 20; // a pen line across the strip
+            } else if (m.dist(Vec2::new(60.0, 12.0)) - 2.5).abs() < 0.5 {
+                luma[i] = 20; // a drawn "0"
+            }
+        }
+    }
+    (solidcraft_doc::canvas::base64_encode(&gray_png(w, h, &luma).unwrap()), corners, holes)
+}
+
+#[test]
+fn a_skin_strip_with_its_holes_comes_out_of_an_angled_photo() {
+    let (data, corners, holes) = skin_photo();
+    let mut s = Session::default();
+    let c: Vec<Value> = corners.iter().map(|q| json!([q.x, q.y])).collect();
+    let r = run(
+        &mut s,
+        "repair.skin_from_photo",
+        json!({"data": data, "rectify": {"corners": c, "width_mm": 228.6, "height_mm": 50.8}, "hole_diameter": 3.2, "thickness": 0.635}),
+    );
+    let size = r["size"].as_array().unwrap();
+    assert!((size[0].as_f64().unwrap() - 228.6).abs() < 1e-6 && (size[1].as_f64().unwrap() - 50.8).abs() < 1e-6, "{size:?}");
+    let found = r["holes"].as_array().unwrap();
+    // The 8 holes and the rivet head; the pen line and the digit are not round.
+    assert_eq!(found.len(), 9, "{found:#?}");
+    for c in &holes {
+        let want = Vec2::new(c.x, 50.8 - c.y); // y up
+        let near = found.iter().filter_map(|f| crate::params::vec2(&f["center"])).map(|q| q.dist(want)).fold(f64::INFINITY, f64::min);
+        assert!(near < 0.4, "hole at {want:?}: nearest {near}");
+    }
+    for f in found {
+        let d = f["diameter"].as_f64().unwrap();
+        assert!((d - 3.2).abs() < 0.5, "{f}");
+    }
+    assert!(found.iter().filter(|f| f["dark"] == false).count() == 1);
+    // The sheet body: the strip of 0.635 mm with 9 cut-outs.
+    assert_eq!(r["body"], "Skin");
+    let flat = run(&mut s, "sheet.flat_pattern", json!({}));
+    assert_eq!(flat["cutouts"].as_array().unwrap().len(), 9);
+    let fs = flat["flat_size_mm"].as_array().unwrap();
+    assert!((fs[0].as_f64().unwrap() - 228.6).abs() < 1e-6 && (fs[2].as_f64().unwrap() - 0.635).abs() < 1e-9, "{fs:?}");
+    // One undo step.
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.model.state().sheets.is_empty());
+    // Without rectifying: a plain scale, an outline in pixels, a chosen drawn size, no body.
+    let r = run(
+        &mut s,
+        "repair.skin_from_photo",
+        json!({"data": data, "mm_per_pixel": 0.14, "outline": [[200, 150], [1600, 120], [1650, 480], [150, 450]], "drawn_diameter": 2.4, "polarity": "dark", "body": false}),
+    );
+    assert!(r["body"].is_null());
+    let found = r["holes"].as_array().unwrap();
+    assert_eq!(found.len(), 8, "{found:#?}");
+    assert!(found.iter().all(|f| f["diameter"] == 2.4 && f["dark"] == true));
+    assert!(fails(&mut s, "repair.skin_from_photo", json!({"data": data})).contains("scale"));
+    assert!(fails(&mut s, "repair.skin_from_photo", json!({"data": data, "mm_per_pixel": 0.1, "outline": [[0, 0], [1, 1]]})).contains("outline"));
+    assert!(
+        fails(
+            &mut s,
+            "repair.skin_from_photo",
+            json!({"data": data, "rectify": {"corners": [[0, 0], [1, 0], [2, 0], [0, 1]], "width_mm": 10, "height_mm": 10}})
+        )
+        .contains("rectangle")
+    );
 }

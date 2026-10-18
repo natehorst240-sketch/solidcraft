@@ -507,6 +507,7 @@
   "cmd.render_status": "渲染进度",
   "cmd.repair_doubler": "修理加强板",
   "cmd.repair_doubler_sketch": "修理加强板草图",
+  "cmd.repair_skin_from_photo": "从照片生成蒙皮",
   "cmd.repair_trace_photo": "从照片描摹损伤",
   "cmd.select_clear": "清除选择",
   "cmd.sheet_convert": "转换为钣金",

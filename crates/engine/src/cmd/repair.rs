@@ -42,6 +42,18 @@ pub static COMMANDS: &[CommandSpec] = &[
          → {cutout, doubler: {type: circle|rounded_rectangle, center, angle_deg, width, height, radius, segments}, rivets: [[x,y], …], rivet_diameter, rows: [{offset, count, pitch}], damage: {points, area}, dxf | path}; \
          DXF layers: DOUBLER (the plate's outline), RIVET (its holes), CUTOUT (dashed: what to trim out of the skin), DAMAGE (dashed: the damage as given), NOTES"
     ),
+    CommandSpec::new("repair.skin_from_photo", "Skin from Photo", skin_from_photo).at("SHEET METAL", "CREATE").icon("flat").params(
+        "the flat model of a skin from a photo: path | data; the scale as repair.trace_photo takes it (calibrate: {a, b, distance} | mm_per_pixel | width_mm); \
+         outline: [[px,py], …] (3 or more corners of the region to model, in the photo's pixels; default the whole photo); \
+         rectify?: {corners: [[px,py] × 4 top-left, top-right, bottom-right, bottom-left], width_mm, height_mm} (a rectangle of known size in the photo: \
+         the photo is straightened through it and it sets the scale; outline defaults to it); \
+         holes?: bool (default true: find the holes and rivet heads), hole_diameter?: mm (the one to expect, default 3.2; marks from half to twice it are taken), \
+         polarity?: dark|light|both (default both), threshold?: 0…1 of white (default from the photo's brightness), drawn_diameter?: mm (draw every hole this size, default as measured); \
+         thickness?: mm (a sheet rule `Skin` of this thickness becomes active; default the active rule), body?: bool (default true: sheet.flange on the sketch), \
+         name? (default Skin), plane? (default XY) \
+         → {sketch, body, outline: [[x,y], …] mm, size: [w, h], holes: [{center: [x,y], diameter, center_px, dark}], mm_per_pixel}; \
+         the origin is the outline's bottom-left corner, y up",
+    ),
     CommandSpec::new("repair.doubler_sketch", "Repair Doubler Sketch", doubler_sketch).at("SHEET METAL", "CREATE").icon("flat").params(
         "the parameters of repair.doubler, drawn as a sketch (the plate's outline and its rivet holes): plane? (when no sketch is active, a new sketch on it; default XY), name? (default Doubler), at?: [x,y] offset; \
          sheet.flange {sketch, profiles: [{point: profile_point}]} makes the plate with its holes, sheet.export_dxf its flat pattern → {sketch, created_sketch, curves, rivets, size, profile_point: [x,y] on the plate}"
@@ -674,8 +686,14 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
     };
     // mm per grid pixel.
     let k = k_photo * f;
-    let o =
-        TraceOptions { threshold, invert, despeckle, min_area_px: ((min_area / (k * k)).ceil().clamp(1.0, 1e9)) as usize, simplify_px: simplify / k };
+    let o = TraceOptions {
+        threshold,
+        invert,
+        despeckle,
+        min_area_px: ((min_area / (k * k)).ceil().clamp(1.0, 1e9)) as usize,
+        max_area_px: usize::MAX,
+        simplify_px: simplify / k,
+    };
     let t = photo_trace::trace_luma(w, h, luma, &o).map_err(|e| bad(cmd, e.to_string()))?;
     // Which mark: by index, by a pixel on it, or the largest.
     let chosen = if let Some(r) = p.get("region").filter(|v| !v.is_null()) {
@@ -726,6 +744,188 @@ fn trace_value(p: &Value, cmd: &str) -> Result<Value> {
         "width_px": ow, "height_px": oh, "mm_per_pixel": k_photo, "downsampled_by": photo.downsampled_by,
         "width_mm": f64::from(ow) * k_photo, "height_mm": f64::from(oh) * k_photo,
         "chosen": chosen, "regions": regions,
+    }))
+}
+
+/// A list of `[px, py]` photo pixels (3 or more), finite.
+fn pixel_polygon(v: &Value, cmd: &str, k: &str) -> Result<Vec<Vec2>> {
+    let arr = v.as_array().ok_or_else(|| bad(cmd, format!("`{k}` must be [[px,py], …]")))?;
+    if arr.len() < 3 || arr.len() > 10_000 {
+        return Err(bad(cmd, format!("`{k}` needs 3 to 10000 points")));
+    }
+    arr.iter()
+        .map(|q| vec2(q).filter(|q| q.is_finite() && q.x.abs() < 1e7 && q.y.abs() < 1e7))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| bad(cmd, format!("`{k}` must be [[px,py], …]")))
+}
+
+fn skin_from_photo(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "repair.skin_from_photo";
+    let bytes = photo_bytes(p, cmd)?;
+    let photo = photo_trace::decode_luma(&bytes).map_err(|e| bad(cmd, e.to_string()))?;
+    let f = f64::from(photo.downsampled_by);
+    let [ow, oh] = photo.original;
+    // Photo pixel → mm with y down: a plain scale, or a homography through a known rectangle.
+    let (to_mm_ydown, k_photo, default_outline): (Box<dyn Fn(Vec2) -> Option<Vec2>>, f64, Vec<Vec2>) = if let Some(r) =
+        p.get("rectify").filter(|v| !v.is_null())
+    {
+        let corners = r.get("corners").map(|c| pixel_polygon(c, cmd, "rectify.corners")).transpose()?.unwrap_or_default();
+        let [c0, c1, c2, c3] = <[Vec2; 4]>::try_from(corners.clone()).map_err(|_| bad(cmd, "`rectify.corners` must be four [px,py] corners"))?;
+        let wm = num(r, "width_mm").filter(|w| *w > 1e-3 && *w < 1e7).ok_or_else(|| bad(cmd, "`rectify.width_mm` must be a positive length (mm)"))?;
+        let hm =
+            num(r, "height_mm").filter(|h| *h > 1e-3 && *h < 1e7).ok_or_else(|| bad(cmd, "`rectify.height_mm` must be a positive length (mm)"))?;
+        let h = photo_trace::homography([c0, c1, c2, c3], [Vec2::ZERO, Vec2::new(wm, 0.0), Vec2::new(wm, hm), Vec2::new(0.0, hm)])
+            .ok_or_else(|| bad(cmd, "`rectify.corners` must be the four corners of a rectangle (no three in line)"))?;
+        let area_px = Loop2::polygon(&corners).signed_area().abs();
+        if area_px < 4.0 {
+            return Err(bad(cmd, "`rectify.corners` enclose no area"));
+        }
+        let k = (wm * hm / area_px).sqrt();
+        (Box::new(move |q| photo_trace::map_point(&h, q)), k, corners)
+    } else {
+        let k = if let Some(k) = p.get("mm_per_pixel").filter(|v| !v.is_null()) {
+            k.as_f64().filter(|k| k.is_finite() && *k > 1e-6 && *k < 1e4).ok_or_else(|| bad(cmd, "`mm_per_pixel` must be a positive number"))?
+        } else if let Some(wm) = p.get("width_mm").filter(|v| !v.is_null()) {
+            let wm =
+                wm.as_f64().filter(|w| w.is_finite() && *w > 1e-3 && *w < 1e7).ok_or_else(|| bad(cmd, "`width_mm` must be a positive number"))?;
+            wm / f64::from(ow)
+        } else if let Some(c) = p.get("calibrate").filter(|v| !v.is_null()) {
+            let a = c.get("a").and_then(vec2).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`calibrate.a` must be [px, py]"))?;
+            let b = c.get("b").and_then(vec2).filter(|q| q.is_finite()).ok_or_else(|| bad(cmd, "`calibrate.b` must be [px, py]"))?;
+            let dist = num(c, "distance")
+                .filter(|d| *d > 1e-3 && *d < 1e7)
+                .ok_or_else(|| bad(cmd, "`calibrate.distance` must be a positive length (mm)"))?;
+            if a.dist(b) < 1.0 {
+                return Err(bad(cmd, "`calibrate.a` and `calibrate.b` must be different pixels"));
+            }
+            dist / a.dist(b)
+        } else {
+            return Err(bad(cmd, "give the scale: `calibrate: {a, b, distance}`, `mm_per_pixel`, `width_mm` or `rectify`"));
+        };
+        let whole = vec![Vec2::ZERO, Vec2::new(f64::from(ow), 0.0), Vec2::new(f64::from(ow), f64::from(oh)), Vec2::new(0.0, f64::from(oh))];
+        (Box::new(move |q| Some(q * k)), k, whole)
+    };
+    let outline_px = match p.get("outline").filter(|v| !v.is_null()) {
+        Some(v) => pixel_polygon(v, cmd, "outline")?,
+        None => default_outline,
+    };
+    let outline_poly = Loop2::polygon(&outline_px);
+    if outline_poly.signed_area().abs() < 4.0 {
+        return Err(bad(cmd, "`outline` encloses no area"));
+    }
+    // The outline in mm (y down for now).
+    let outline_dn: Vec<Vec2> =
+        outline_px.iter().map(|q| to_mm_ydown(*q)).collect::<Option<_>>().ok_or_else(|| bad(cmd, "`outline` reaches the photo's horizon"))?;
+    let (x0, y1) = outline_dn.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(x0, y1), q| (x0.min(q.x), y1.max(q.y)));
+    let to_mm = |q: Vec2| to_mm_ydown(q).map(|m| Vec2::new(m.x - x0, y1 - m.y));
+    let outline_mm: Vec<Vec2> = outline_dn.iter().map(|m| Vec2::new(m.x - x0, y1 - m.y)).collect();
+    let (w, h) = outline_mm.iter().fold((0.0f64, 0.0f64), |(w, h), q| (w.max(q.x), h.max(q.y)));
+    if w > 1e5 || h > 1e5 {
+        return Err(bad(cmd, "the region is too large (100 m)"));
+    }
+    // The holes.
+    let want_holes = bool_(p, "holes").unwrap_or(true);
+    let expected = mm(p, "hole_diameter", cmd, 3.2, 0.2, 500.0)?;
+    let drawn = match p.get("drawn_diameter").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => Some(mm(p, "drawn_diameter", cmd, expected, 0.1, 500.0)?),
+    };
+    let (dark, light) = match str_(p, "polarity").map(str::to_ascii_lowercase).as_deref() {
+        None | Some("both") => (true, true),
+        Some("dark") => (true, false),
+        Some("light") => (false, true),
+        Some(_) => return Err(bad(cmd, "`polarity` must be dark, light or both")),
+    };
+    let threshold = match p.get("threshold").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => Some(mm(p, "threshold", cmd, 0.5, 0.0, 1.0)?),
+    };
+    let mut holes: Vec<(Vec2, f64, Vec2, bool)> = Vec::new();
+    if want_holes {
+        let k_grid = k_photo * f;
+        let o = photo_trace::BlobOptions { threshold, diameter_px: [expected * 0.5 / k_grid, expected * 2.0 / k_grid], dark, light };
+        let found = photo_trace::blobs(photo.width, photo.height, &photo.luma, &o).map_err(|e| bad(cmd, e.to_string()))?;
+        for b in found {
+            let c_px = b.center * f;
+            if !outline_poly.contains(c_px) {
+                continue;
+            }
+            let Some(c_mm) = to_mm(c_px) else { continue };
+            let d = drawn.unwrap_or(b.diameter_px * k_grid);
+            // Inside the outline by at least its radius, so the sketch stays one profile.
+            if c_mm.x < d / 2.0 || c_mm.y < d / 2.0 || c_mm.x > w - d / 2.0 || c_mm.y > h - d / 2.0 {
+                continue;
+            }
+            if holes.len() >= 2000 {
+                return Err(bad(cmd, "more than 2000 holes: raise `hole_diameter` or narrow `outline`"));
+            }
+            holes.push((c_mm, d, c_px, b.dark));
+        }
+    }
+    // The sheet rule.
+    if let Some(t) = p.get("thickness").filter(|v| !v.is_null()) {
+        let t = t.as_f64().filter(|t| t.is_finite() && *t > 0.01 && *t < 100.0).ok_or_else(|| bad(cmd, "`thickness` must be a length in mm"))?;
+        let rule = super::find_command("sheet.manage_rules").ok_or_else(|| bad(cmd, "sheet.manage_rules"))?;
+        rule.run_nested(s, &json!({"name": "Skin", "thickness": format!("{t} mm"), "active": true}))?;
+    }
+    // The sketch: the outline and a circle per hole.
+    let name = str_(p, "name").unwrap_or("Skin");
+    let cp = json!({"plane": p.get("plane").cloned().unwrap_or(json!("XY")), "project_edges": false, "name": name});
+    let r = (super::find_command("sketch.create").ok_or_else(|| bad(cmd, "sketch.create"))?.run)(s, &cp)?;
+    let sketch = r.get("sketch").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "sketch.create gave no sketch"))?;
+    let outline_sk = outline_mm.clone();
+    let holes_sk: Vec<(Vec2, f64)> = holes.iter().map(|(c, d, _, _)| (*c, *d)).collect();
+    let (n_curves, _) = edit(s, p, cmd, false, |sk, _| {
+        let m = outline_sk.len();
+        let mut ids = Vec::with_capacity(m);
+        for q in &outline_sk {
+            ids.push(sk.add_point(*q, None)?);
+        }
+        let mut n = 0;
+        for i in 0..m {
+            let (Some(&a), Some(&b)) = (ids.get(i), ids.get((i + 1) % m)) else { continue };
+            let (Some(&pa), Some(&pb)) = (outline_sk.get(i), outline_sk.get((i + 1) % m)) else { continue };
+            if pa.dist(pb) < 1e-9 {
+                continue;
+            }
+            sk.add_line(pa, pb, Some(a), Some(b), None)?;
+            n += 1;
+        }
+        for (c, d) in &holes_sk {
+            sk.add_circle(*c, d / 2.0, None, None)?;
+            n += 1;
+        }
+        Ok(n)
+    })?;
+    (super::find_command("sketch.finish").ok_or_else(|| bad(cmd, "sketch.finish"))?.run)(s, &json!({}))?;
+    // The sheet body, from a point on the skin that is in no hole.
+    let mut body = Value::Null;
+    if bool_(p, "body").unwrap_or(true) {
+        let centroid = Loop2::polygon(&outline_mm).centroid();
+        let clear =
+            |q: Vec2| outline_mm.len() >= 3 && Loop2::polygon(&outline_mm).contains(q) && holes.iter().all(|(c, d, _, _)| c.dist(q) > d / 2.0 + 0.05);
+        let mut pick = clear(centroid).then_some(centroid);
+        let mut step = 1.0;
+        while pick.is_none() && step < w.max(h) {
+            for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
+                let q = centroid + Vec2::new(dx * step, dy * step);
+                if clear(q) {
+                    pick = Some(q);
+                    break;
+                }
+            }
+            step *= 1.5;
+        }
+        let point = pick.ok_or_else(|| bad(cmd, "no point of the skin is clear of its holes"))?;
+        let fl = super::find_command("sheet.flange").ok_or_else(|| bad(cmd, "sheet.flange"))?;
+        let fr = fl.run_nested(s, &json!({"sketch": sketch, "profiles": [{"point": [point.x, point.y]}], "body_name": name}))?;
+        body = fr.get("bodies").and_then(|b| b.get(0)).cloned().unwrap_or(Value::Null);
+    }
+    Ok(json!({
+        "sketch": sketch, "body": body, "curves": n_curves,
+        "outline": outline_mm.iter().map(|q| pt(*q)).collect::<Vec<_>>(), "size": [w, h],
+        "holes": holes.iter().map(|(c, d, px, dark)| json!({"center": pt(*c), "diameter": d, "center_px": pt(*px), "dark": dark})).collect::<Vec<_>>(),
+        "mm_per_pixel": k_photo, "width_px": ow, "height_px": oh,
     }))
 }
 

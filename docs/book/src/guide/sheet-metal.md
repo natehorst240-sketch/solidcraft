@@ -341,6 +341,16 @@ can come straight from a photograph of the skin with the damage marked up.
    `profile_point`, so the holes stay holes) makes the doubler of the active rule's thickness,
    `sheet.flat_pattern` and `sheet.export_dxf` give the shop its flat pattern.
 
+The skin itself can come from the photo too: `repair.skin_from_photo` takes the photo, its
+scale (the same `calibrate`, `mm_per_pixel` or `width_mm`) and the region to model as
+`outline` (its corners in the photo's pixels), finds the holes and rivet heads inside it
+(`hole_diameter` says what size to expect; `polarity` dark, light or both), and makes a sketch
+of the region with a circle at every hole plus a sheet body of `thickness` (a rule `Skin`). With
+`rectify: {corners, width_mm, height_mm}` (four corners of a rectangle of known size in the
+photo) an angled photo is straightened first and the rectangle sets the scale. The result lists
+every hole with its centre in mm and in photo pixels, so a wrong hit can be deleted from the
+sketch. The repair is then modelled on that body.
+
 The rivet layout follows general practice for riveted patch repairs (for instance FAA
 AC 43.13-1B, chapter 4): `rivet_diameter` (default 3.2 mm), `edge_distance` (default 2.5 ×
 the diameter, never under the diameter), `pitch` along a row (default 5 ×), `row_pitch` between

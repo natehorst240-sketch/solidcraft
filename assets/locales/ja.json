@@ -507,6 +507,7 @@
   "cmd.render_status": "レンダリングの進行状況",
   "cmd.repair_doubler": "補修ダブラー",
   "cmd.repair_doubler_sketch": "補修ダブラーのスケッチ",
+  "cmd.repair_skin_from_photo": "写真から外板",
   "cmd.repair_trace_photo": "写真から損傷をトレース",
   "cmd.select_clear": "選択をクリア",
   "cmd.sheet_convert": "板金に変換",

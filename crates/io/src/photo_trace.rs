@@ -23,7 +23,7 @@ pub const MAX_PHOTO_EDGE: u32 = 4096;
 /// The longest photo edge the decoder accepts at all.
 pub const MAX_DECODE_EDGE: u32 = 12_000;
 /// The most regions a trace reports (the largest first).
-pub const MAX_REGIONS: usize = 64;
+pub const MAX_REGIONS: usize = 512;
 const MAX_CODEC_BYTES: u64 = 640 << 20;
 /// The most boundary edges the kept regions may have between them (a 4096² image of 1-pixel
 /// lines could otherwise cost gigabytes).
@@ -48,13 +48,15 @@ pub struct TraceOptions {
     pub despeckle: bool,
     /// Regions with fewer pixels than this are noise.
     pub min_area_px: usize,
+    /// Regions with more pixels than this are not what is looked for (the panel, a shadow).
+    pub max_area_px: usize,
     /// Douglas–Peucker tolerance for the outlines, in pixels.
     pub simplify_px: f64,
 }
 
 impl Default for TraceOptions {
     fn default() -> Self {
-        TraceOptions { threshold: 0.5, invert: false, despeckle: true, min_area_px: 16, simplify_px: 1.0 }
+        TraceOptions { threshold: 0.5, invert: false, despeckle: true, min_area_px: 16, max_area_px: usize::MAX, simplify_px: 1.0 }
     }
 }
 
@@ -167,7 +169,7 @@ pub fn trace_luma(w: u32, h: u32, luma: &[u8], o: &TraceOptions) -> Result<Trace
     if o.despeckle {
         mask = majority(wi, hi, &mask);
     }
-    let regions = components(wi, hi, &mask, o.min_area_px.max(1))?;
+    let regions = components(wi, hi, &mask, o.min_area_px.max(1), o.max_area_px)?;
     let mut out = Vec::new();
     for comp in regions.into_iter().take(MAX_REGIONS) {
         let Some(outline) = outer_loop(&comp.edges) else { continue };
@@ -221,7 +223,7 @@ struct Component {
     edges: Vec<(Vec2, Vec2)>,
 }
 
-fn components(w: usize, h: usize, mask: &[bool], min_area: usize) -> Result<Vec<Component>, TraceError> {
+fn components(w: usize, h: usize, mask: &[bool], min_area: usize, max_area: usize) -> Result<Vec<Component>, TraceError> {
     let mut label = vec![0u32; w * h];
     let mut stack: Vec<usize> = Vec::new();
     let is_set = |i: usize| mask.get(i).copied().unwrap_or(false);
@@ -265,7 +267,7 @@ fn components(w: usize, h: usize, mask: &[bool], min_area: usize) -> Result<Vec<
                 visit(i + w);
             }
         }
-        if area < min_area {
+        if area < min_area || area > max_area {
             continue;
         }
         kept.push((area, id));
@@ -494,6 +496,185 @@ pub fn gray_png(w: u32, h: u32, luma: &[u8]) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
+/// A small round mark: a rivet head, a hole, a dot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Blob {
+    /// The centre of its bounding box, in the luminance grid's pixels.
+    pub center: Vec2,
+    /// The diameter of a disc of the same area, in pixels.
+    pub diameter_px: f64,
+    /// Darker than its surroundings (else lighter).
+    pub dark: bool,
+    pub area_px: usize,
+}
+
+/// What [`blobs`] looks for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlobOptions {
+    /// Luminance cut (0 … 1 of white) for both polarities; `None`: from the photo's median
+    /// brightness (dark marks below half of it, light marks above halfway from it to white).
+    pub threshold: Option<f64>,
+    /// The diameters wanted, in pixels (inclusive).
+    pub diameter_px: [f64; 2],
+    /// Dark marks, light marks, or both.
+    pub dark: bool,
+    pub light: bool,
+}
+
+/// Round marks of the wanted size: regions whose box is nearly square and nearly filled
+/// (a ring, a digit or a line is not one). Sorted by area, the largest first.
+pub fn blobs(w: u32, h: u32, luma: &[u8], o: &BlobOptions) -> Result<Vec<Blob>, TraceError> {
+    let [d0, d1] = o.diameter_px;
+    if !(d0.is_finite() && d1.is_finite() && d0 > 0.0 && d1 >= d0) {
+        return Err(TraceError::Invalid("the blob diameters must be positive, the smallest first".into()));
+    }
+    let area = |d: f64| std::f64::consts::PI * d * d / 4.0;
+    // The photo's median brightness, for the adaptive cuts.
+    let median = {
+        let mut hist = [0usize; 256];
+        for &v in luma {
+            hist[usize::from(v)] += 1;
+        }
+        let half = luma.len() / 2;
+        let mut seen = 0usize;
+        hist.iter()
+            .position(|&n| {
+                seen += n;
+                seen > half
+            })
+            .unwrap_or(128) as f64
+            / 255.0
+    };
+    // What counts as dark around a light mark (the ring test).
+    let dark_cut = (o.threshold.unwrap_or(median / 2.0) * 255.0).round() as i32;
+    let mut out = Vec::new();
+    for invert in [false, true] {
+        if (invert && !o.light) || (!invert && !o.dark) {
+            continue;
+        }
+        let threshold = match o.threshold {
+            Some(t) => t,
+            None if invert => median + (1.0 - median) / 2.0,
+            None => median / 2.0,
+        };
+        if !(threshold.is_finite() && (0.0..=1.0).contains(&threshold)) {
+            return Err(TraceError::Invalid("`threshold` must be between 0 and 1".into()));
+        }
+        let t = trace_luma(
+            w,
+            h,
+            luma,
+            &TraceOptions {
+                threshold,
+                invert,
+                despeckle: true,
+                min_area_px: (area(d0) * 0.5).floor().max(1.0) as usize,
+                max_area_px: (area(d1) * 2.0).ceil() as usize,
+                simplify_px: 0.0,
+            },
+        )?;
+        for r in t.regions {
+            let (bw, bh) = (r.bbox[2] - r.bbox[0], r.bbox[3] - r.bbox[1]);
+            if bw <= 0.0 || bh <= 0.0 {
+                continue;
+            }
+            let aspect = bw / bh;
+            let fill = r.area_px as f64 / (bw * bh);
+            let diameter_px = 2.0 * (r.area_px as f64 / std::f64::consts::PI).sqrt();
+            if !(0.6..=1.67).contains(&aspect) || fill < 0.6 || diameter_px < d0 || diameter_px > d1 {
+                continue;
+            }
+            let center = Vec2::new((r.bbox[0] + r.bbox[2]) / 2.0, (r.bbox[1] + r.bbox[3]) / 2.0);
+            // The light inside of a drawn ring (a "0", a circled note) is round too: a light mark
+            // whose surroundings are mostly dark is not a rivet head.
+            if invert && ringed_by_dark(w, h, luma, center, diameter_px / 2.0, dark_cut) {
+                continue;
+            }
+            out.push(Blob { center, diameter_px, dark: !invert, area_px: r.area_px });
+        }
+    }
+    out.sort_by_key(|b| std::cmp::Reverse(b.area_px));
+    Ok(out)
+}
+
+/// More than half of the pixels just outside a disc of radius `r` around `c` (a band 0.5 to
+/// 3.5 pixels beyond it) are darker than `cut`: the disc is the inside of a drawn ring.
+fn ringed_by_dark(w: u32, h: u32, luma: &[u8], c: Vec2, r: f64, cut: i32) -> bool {
+    let (r0, r1) = (r + 0.5, r + 3.5);
+    let (mut dark, mut n) = (0usize, 0usize);
+    let (x0, x1) = (((c.x - r1).floor().max(0.0)) as u32, ((c.x + r1).ceil().max(0.0)) as u32);
+    let (y0, y1) = (((c.y - r1).floor().max(0.0)) as u32, ((c.y + r1).ceil().max(0.0)) as u32);
+    for y in y0..y1.min(h) {
+        for x in x0..x1.min(w) {
+            let d = Vec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5).dist(c);
+            if d < r0 || d > r1 {
+                continue;
+            }
+            n += 1;
+            if luma.get((y * w + x) as usize).is_some_and(|&v| i32::from(v) < cut) {
+                dark += 1;
+            }
+        }
+    }
+    n > 0 && dark * 2 > n
+}
+
+/// The projective map (a 3 × 3 matrix, row-major) taking the four `from` points to the four
+/// `to` points, in order; `None` when three of either are in line.
+pub fn homography(from: [Vec2; 4], to: [Vec2; 4]) -> Option<[f64; 9]> {
+    // Direct linear transform: eight equations in the eight unknowns of H with h33 = 1.
+    let mut m = [[0.0f64; 9]; 8];
+    for i in 0..4 {
+        let (p, q) = (from.get(i)?, to.get(i)?);
+        if !(p.is_finite() && q.is_finite()) {
+            return None;
+        }
+        *m.get_mut(2 * i)? = [p.x, p.y, 1.0, 0.0, 0.0, 0.0, -q.x * p.x, -q.x * p.y, q.x];
+        *m.get_mut(2 * i + 1)? = [0.0, 0.0, 0.0, p.x, p.y, 1.0, -q.y * p.x, -q.y * p.y, q.y];
+    }
+    // Gaussian elimination with partial pivoting on the augmented 8 × 9 system.
+    for col in 0..8 {
+        let pivot = (col..8).max_by(|&a, &b| m.get(a).map_or(0.0, |r| r[col].abs()).total_cmp(&m.get(b).map_or(0.0, |r| r[col].abs())))?;
+        if m.get(pivot)?[col].abs() < 1e-12 {
+            return None;
+        }
+        m.swap(col, pivot);
+        let row = *m.get(col)?;
+        for r in 0..8 {
+            if r == col {
+                continue;
+            }
+            let f = m.get(r)?[col] / row[col];
+            if f != 0.0 {
+                let target = m.get_mut(r)?;
+                for c in 0..9 {
+                    target[c] -= f * row[c];
+                }
+            }
+        }
+    }
+    let mut h = [0.0; 9];
+    for i in 0..8 {
+        let r = m.get(i)?;
+        h[i] = r[8] / r[i];
+        if !h[i].is_finite() {
+            return None;
+        }
+    }
+    h[8] = 1.0;
+    Some(h)
+}
+
+/// `p` through the homography `h`; `None` at its horizon.
+pub fn map_point(h: &[f64; 9], p: Vec2) -> Option<Vec2> {
+    let w = h[6] * p.x + h[7] * p.y + h[8];
+    if w.abs() < 1e-12 {
+        return None;
+    }
+    let q = Vec2::new((h[0] * p.x + h[1] * p.y + h[2]) / w, (h[3] * p.x + h[4] * p.y + h[5]) / w);
+    q.is_finite().then_some(q)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +823,56 @@ mod tests {
         // Within the limit nothing changes.
         let small = decode_luma(&gray_png(4096, 2, &[0; 8192]).unwrap()).unwrap();
         assert_eq!((small.downsampled_by, small.width), (1, 4096));
+    }
+
+    #[test]
+    fn round_marks_are_found_and_rings_lines_and_digits_are_not() {
+        let (w, h) = (300u32, 200u32);
+        let mut luma = vec![200u8; (w * h) as usize];
+        let disc = |luma: &mut Vec<u8>, cx: f64, cy: f64, r: f64, v: u8| {
+            for y in 0..h {
+                for x in 0..w {
+                    if (f64::from(x) + 0.5 - cx).hypot(f64::from(y) + 0.5 - cy) <= r {
+                        luma[(y * w + x) as usize] = v;
+                    }
+                }
+            }
+        };
+        disc(&mut luma, 50.0, 50.0, 8.0, 20); // a dark hole
+        disc(&mut luma, 120.0, 60.0, 8.0, 255); // a bright rivet head
+        disc(&mut luma, 200.0, 50.0, 12.0, 20); // a ring (a drawn "0")
+        disc(&mut luma, 200.0, 50.0, 8.0, 200);
+        for x in 20..280 {
+            luma[(150 * w + x) as usize] = 20; // a pen line
+            luma[(151 * w + x) as usize] = 20;
+        }
+        disc(&mut luma, 250.0, 120.0, 30.0, 20); // far too big
+        let o = BlobOptions { threshold: None, diameter_px: [8.0, 32.0], dark: true, light: true };
+        let found = blobs(w, h, &luma, &o).unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        let hole = found.iter().find(|b| b.dark).unwrap();
+        let head = found.iter().find(|b| !b.dark).unwrap();
+        assert!(hole.center.dist(Vec2::new(50.0, 50.0)) < 0.6 && (hole.diameter_px - 16.0).abs() < 1.0, "{hole:?}");
+        assert!(head.center.dist(Vec2::new(120.0, 60.0)) < 0.6 && (head.diameter_px - 16.0).abs() < 1.0, "{head:?}");
+        let dark_only = blobs(w, h, &luma, &BlobOptions { light: false, ..o.clone() }).unwrap();
+        assert_eq!(dark_only.len(), 1);
+        assert!(blobs(w, h, &luma, &BlobOptions { diameter_px: [10.0, 5.0], ..o }).is_err());
+    }
+
+    #[test]
+    fn a_homography_maps_its_corners_and_what_lies_between() {
+        let from = [Vec2::new(100.0, 120.0), Vec2::new(1700.0, 80.0), Vec2::new(1760.0, 520.0), Vec2::new(60.0, 480.0)];
+        let to = [Vec2::new(0.0, 0.0), Vec2::new(228.6, 0.0), Vec2::new(228.6, 50.8), Vec2::new(0.0, 50.8)];
+        let h = homography(from, to).unwrap();
+        for (p, q) in from.iter().zip(&to) {
+            assert!(map_point(&h, *p).unwrap().dist(*q) < 1e-6);
+        }
+        // The inverse takes them back.
+        let inv = homography(to, from).unwrap();
+        let mid = map_point(&h, Vec2::new(900.0, 300.0)).unwrap();
+        assert!(map_point(&inv, mid).unwrap().dist(Vec2::new(900.0, 300.0)) < 1e-6);
+        // Three points in line have no homography.
+        assert!(homography([Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(2.0, 0.0), Vec2::new(0.0, 1.0)], to).is_none());
     }
 
     #[test]
