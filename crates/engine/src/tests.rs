@@ -809,6 +809,10 @@ fn hostile_params_never_panic() {
         "faces",
         "u",
         "v",
+        "damage",
+        "photo",
+        "rows",
+        "calibrate",
     ];
     // Commands are independent; worker threads take them one at a time (their costs vary a lot).
     let ids: Vec<&str> = command_specs()
@@ -826,7 +830,7 @@ fn hostile_params_never_panic() {
                     while let Some(&id) = ids.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         for v in hostile_values() {
                             for k in keys {
-                                if k == "path" && (id.starts_with("parameters.") || id == "timeline.export_script") {
+                                if k == "path" && (id.starts_with("parameters.") || id == "timeline.export_script" || id == "repair.doubler") {
                                     continue; // parameter and script files: covered by their own tests (no stray files)
                                 }
                                 let mut s = Session::default();

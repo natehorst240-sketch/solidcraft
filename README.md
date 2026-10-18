@@ -158,7 +158,9 @@ rebuild with no errors, replayed here at 2× speed.
 - **Sheet metal** with flanges, hems, fold/unfold/refold, material cutouts, flat patterns,
   retained shallow prismatic pockets, exact line/arc/circle DXF outlines and bend tables;
   plastic enclosure features and rules. Pocket depth and side survive unfold/refold and appear
-  separately from through-hole outlines in the flat preview and DXF.
+  separately from through-hole outlines in the flat preview and DXF. Repair doublers (rivet rows
+  around a clean-out cutout, as a DXF or a sketch) from a damage outline or a photo of the
+  marked-up skin.
 - **Files**: design containers (`.solidcraft`) with lossless binary mesh payloads;
   plain JSON remains supported for opening, Save As and export. Desktop Open can show a saved
   provisional picture from warm geometry caches while rebuilding before editing; caches never

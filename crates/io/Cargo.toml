@@ -19,6 +19,8 @@ gltf = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Photo tracing for repair doublers (src/photo_trace.rs): PNG and JPEG decoding, pure Rust.
+image = { workspace = true, features = ["jpeg"] }
 
 # A plain fsync where a network share refuses Apple's full flush (src/safe_write.rs); already in
 # the tree through tempfile.
